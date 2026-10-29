@@ -16,7 +16,7 @@ from datetime import datetime
 from . import __version__
 from .common import default_mem_gb, default_threads, log
 from .constants import MAX_TARGET_LEN
-from .extract import METHODS, spec_from_args, validate_spec
+from .extract import FLANK_DISTANCES, METHODS, spec_from_args, validate_spec
 
 # file (in the output directory) that collects the command of every run
 CMD_LOG = "cmd.log"
@@ -76,8 +76,12 @@ def parse_args(argv=None):
                          "(--*_start, --*_len); flank = between flanking sequences (--*_up, "
                          "--*_down). Example: --method flank none")
     ap.add_argument("--flank_mismatch", type=int, default=2,
-                    help="method flank: max mismatches (Hamming) in each flanking sequence, "
+                    help="method flank: max mismatches in each flanking sequence, "
                          "barcode and target; base qualities are not used to find the flanks")
+    ap.add_argument("--flank_distance", choices=FLANK_DISTANCES, default="hamming",
+                    help="method flank: how a flank is matched to a window of its length: "
+                         "hamming = substitutions only (numpy); levenshtein = substitutions "
+                         "and indels (edlib)")
 
     # step3 : barcode extraction (S1)
     g = ap.add_argument_group("barcode extraction (in --barcode_read)")

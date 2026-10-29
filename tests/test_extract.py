@@ -2,12 +2,16 @@
 S1 extraction (barcodex/extract.py): none / pos / flank methods and the filters.
 """
 
+import random
 import unittest
 
+import edlib
+
 import helpers  # noqa: F401  (puts the package on sys.path)
-from barcodex.extract import (ExtractSpec, SequenceExtractor, find_flank, matches_template,
-                              max_length, parse_allowed_lens, reject_reason_order,
-                              validate_spec)
+from barcodex.extract import (ExtractSpec, SequenceExtractor, extract_sequence,
+                              match_approximate, match_hamming_numpy, match_levenshtein,
+                              matches_template, max_length, parse_allowed_lens,
+                              reject_reason_order, validate_spec)
 
 UP, DOWN = "GTCCTCTTCCCATCT", "TGGTGGAAGC"
 BARCODE = "ACGTACGTACGTACGTACGT"
@@ -34,19 +38,98 @@ class TestParseAllowedLens(unittest.TestCase):
             parse_allowed_lens("0,20")
 
 
-class TestFindFlank(unittest.TestCase):
+def first_window(seq, pattern, max_mismatches, distance):
+    """Reference: sequence_utils.py window loop (Hamming by hand, Levenshtein by edlib NW)."""
+    k = len(pattern)
+    for i in range(len(seq) - k + 1):
+        window = seq[i:i + k]
+        if distance == "hamming":
+            if sum(a != b for a, b in zip(window, pattern)) <= max_mismatches:
+                return i
+        elif edlib.align(window, pattern, mode="NW", k=max_mismatches)["editDistance"] != -1:
+            return i
+    return -1
+
+
+class TestMatchHamming(unittest.TestCase):
 
     def test_exact(self):
-        self.assertEqual(find_flank(b"AAAA" + UP.encode(), UP.encode(), 2), 4)
+        self.assertEqual(match_hamming_numpy(b"AAAA" + UP.encode(), UP.encode(), 2), 4)
 
     def test_mismatch(self):
         flank = UP[:3] + "A" + UP[4:]
-        self.assertEqual(find_flank(b"CC" + flank.encode(), UP.encode(), 1), 2)
-        self.assertEqual(find_flank(b"CC" + flank.encode(), UP.encode(), 0), -1)
+        self.assertEqual(match_hamming_numpy(b"CC" + flank.encode(), UP.encode(), 1), 2)
+        self.assertEqual(match_hamming_numpy(b"CC" + flank.encode(), UP.encode(), 0), -1)
 
-    def test_begin(self):
-        seq = (UP + "A" + UP).encode()
-        self.assertEqual(find_flank(seq, UP.encode(), 0, 1), len(UP) + 1)
+    def test_first_window_before_exact(self):
+        # the first window within the limit wins, even before an exact match
+        flank = UP[:3] + "A" + UP[4:]
+        seq = (flank + "CC" + UP).encode()
+        self.assertEqual(match_hamming_numpy(seq, UP.encode(), 1), 0)
+        self.assertEqual(match_hamming_numpy(seq, UP.encode(), 0), len(UP) + 2)
+
+    def test_short_read(self):
+        self.assertEqual(match_hamming_numpy(UP[:5].encode(), UP.encode(), 2), -1)
+
+
+class TestMatchLevenshtein(unittest.TestCase):
+
+    def test_deletion(self):
+        # the window has the flank length: a deletion pulls in one more base = 2 edits
+        deleted = UP[:5] + UP[6:]
+        seq = "CC" + deleted + "TTTT"
+        self.assertEqual(match_levenshtein(seq.encode(), UP.encode(), 1), -1)
+        self.assertEqual(match_levenshtein(seq.encode(), UP.encode(), 2),
+                         first_window(seq, UP, 2, "levenshtein"))
+        self.assertNotEqual(match_levenshtein(seq.encode(), UP.encode(), 2), -1)
+
+    def test_exact_flank_shifted_window(self):
+        # same as sequence_utils.py: the window one base before an exact flank differs by 2
+        # edits (one deletion, one insertion), so with 2 edits it is the first match
+        seq = ("AAAA" + UP + "CC").encode()
+        self.assertEqual(match_levenshtein(seq, UP.encode(), 1), 4)
+        self.assertEqual(match_levenshtein(seq, UP.encode(), 2), 3)
+
+    def test_short_read(self):
+        self.assertEqual(match_levenshtein(UP[:5].encode(), UP.encode(), 2), -1)
+
+    def test_unknown_distance(self):
+        with self.assertRaises(ValueError):
+            match_approximate(b"ACGT", b"AC", 0, "edit")
+
+
+class TestSameAsSequenceUtils(unittest.TestCase):
+
+    def test_random_reads(self):
+        # random reads with mutated flanks: the same first window as the plain window loop
+        rng = random.Random(1)
+        for _ in range(400):
+            flank = list(UP)
+            for _ in range(rng.randint(0, 3)):
+                pos = rng.randrange(len(flank))
+                op = rng.choice("sdi")
+                if op == "s":
+                    flank[pos] = rng.choice("ACGT")
+                elif op == "d":
+                    del flank[pos]
+                else:
+                    flank.insert(pos, rng.choice("ACGT"))
+            seq = "".join(rng.choice("ACGT") for _ in range(rng.randint(0, 80))) + "".join(flank)
+            seq += "".join(rng.choice("ACGT") for _ in range(rng.randint(0, 40)))
+            for distance in ("hamming", "levenshtein"):
+                for mm in (0, 1, 2):
+                    self.assertEqual(match_approximate(seq.encode(), UP.encode(), mm, distance),
+                                     first_window(seq, UP, mm, distance), (seq, distance, mm))
+
+    def test_extract_sequence(self):
+        seq = ("NN" + UP + BARCODE + DOWN + "AC").encode()
+        start = 2 + len(UP)
+        self.assertEqual(extract_sequence(seq, UP.encode(), DOWN.encode(), 0, "hamming"),
+                         (start, start + len(BARCODE)))
+        self.assertEqual(extract_sequence(seq, b"TTTTTTTTTTTT", DOWN.encode(), 1, "hamming"),
+                         "upstream not found")
+        self.assertEqual(extract_sequence(seq, UP.encode(), b"GGGGGGGGGGGG", 1, "levenshtein"),
+                         "downstream not found")
 
 
 class TestMethods(unittest.TestCase):
@@ -75,6 +158,18 @@ class TestMethods(unittest.TestCase):
         self.assertEqual(locate(spec, UP + BARCODE + "C" * 12), "barcode_downstream_not_found")
         self.assertEqual(locate(spec, UP + DOWN), "barcode_empty")
 
+    def test_flank_levenshtein(self):
+        spec = ExtractSpec("barcode", method="flank", up=UP, down=DOWN, flank_mismatch=2,
+                           flank_distance="levenshtein")
+        hamming = ExtractSpec("barcode", method="flank", up=UP, down=DOWN, flank_mismatch=2)
+        up_del = UP[:5] + UP[6:]
+        read = "NN" + up_del + BARCODE + DOWN + "AC"
+        self.assertEqual(locate(hamming, read), "barcode_upstream_not_found")
+        start = first_window(read, UP, 2, "levenshtein") + len(UP)
+        end = start + first_window(read[start:], DOWN, 2, "levenshtein")
+        self.assertEqual(locate(spec, read), read[start:end])
+        self.assertEqual(locate(spec, "A" * 20 + BARCODE + DOWN), "barcode_upstream_not_found")
+        self.assertEqual(locate(spec, UP + BARCODE + "C" * 12), "barcode_downstream_not_found")
 
 class TestFilters(unittest.TestCase):
 

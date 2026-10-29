@@ -22,9 +22,16 @@ requires-python = ">=3.10"
 #            reading the shards (S4), target assignment and output files (S5).
 #            Needs the SQL functions hamming, levenshtein, bit_count, xor, hash, arg_min and
 #            COPY ... PARTITION_BY; tested with 1.2.2.
+#   numpy    flank method, --flank_distance hamming (match_hamming_numpy): compares the flank
+#            with every window of a read at once; needs sliding_window_view (numpy >= 1.20);
+#            tested with 2.3.5.
+#   edlib    flank method, --flank_distance levenshtein (match_levenshtein): edit distance
+#            between the flank and a window; tested with 1.3.9.post1.
 #   Everything else is the Python standard library (argparse, multiprocessing, gzip, json, ...).
 dependencies = [
     "duckdb>=1.2.2,<2",
+    "numpy>=1.20",
+    "edlib>=1.3",
 ]
 
 # Optional system tool (not a Python package; found on PATH)

@@ -46,6 +46,17 @@ class TestOptions(unittest.TestCase):
         self.assertEqual([spec_from_args(args, role, True).flank_mismatch
                           for role in ("barcode", "target")], [1, 1])
 
+    def test_flank_distance(self):
+        args = args_for("--method", "flank", "flank", "--flank_distance", "levenshtein",
+                        "--barcode_up", "AAAA", "--barcode_down", "CCCC",
+                        "--target_up", "GGGG", "--target_down", "TTTT")
+        validate_args(args)
+        self.assertEqual([spec_from_args(args, role, True).flank_distance
+                          for role in ("barcode", "target")], ["levenshtein", "levenshtein"])
+        self.assertEqual(args_for("--method", "none", "none").flank_distance, "hamming")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            args_for("--method", "flank", "none", "--flank_distance", "edit")
+
     def test_unknown_method(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             args_for("--method", "whole", "none")

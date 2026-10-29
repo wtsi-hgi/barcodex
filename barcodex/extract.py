@@ -7,9 +7,16 @@ Three methods, chosen independently for the barcode and the target with
   pos    by position: --*_start (0-based) and --*_len (0 = to the end of the read)
   flank  the sequence between an upstream (--*_up) and a downstream (--*_down) flanking
          sequence.  Flanks are matched on the sequence only (base qualities are not used),
-         with up to --flank_mismatch Hamming mismatches.  The downstream flank is searched
-         after the end of the upstream flank.  An exact flank match is preferred; otherwise
-         the first position within the mismatch limit is used.
+         with up to --flank_mismatch mismatches (extract_sequence of sequence_utils.py).  The
+         downstream flank is searched after the end of the upstream flank.  How a flank is
+         searched is chosen with --flank_distance:
+           hamming      the first window (of the flank length) with <= --flank_mismatch
+                        substitutions; all windows are compared at once with numpy
+                        (match_hamming_numpy)
+           levenshtein  the first window (of the flank length) whose edit distance to the
+                        flank, substitutions and indels, is <= --flank_mismatch (edlib,
+                        match_levenshtein)
+         The sequence starts len(--*_up) bases after the start of the upstream window.
 
 Optional filters, applied after the extraction:
   max_len            hard limit set by the code (targets: 255 bp, the width of the quality mask)
@@ -26,7 +33,12 @@ reject counters add up to the number of rejected pairs; see reject_reason_order)
 
 from dataclasses import dataclass, field
 
+import edlib
+import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+
 METHODS = ("none", "pos", "flank")
+FLANK_DISTANCES = ("hamming", "levenshtein")
 TEMPLATE_BASES = set("ACGTN")
 
 
@@ -45,7 +57,9 @@ class ExtractSpec:
             -- require_full_len: bool: pos method: reject reads too short for start + length
             -- up: str: flank method: upstream flanking sequence
             -- down: str: flank method: downstream flanking sequence
-            -- flank_mismatch: int: flank method: max Hamming mismatches per flank
+            -- flank_mismatch: int: flank method: max edits per flank
+            -- flank_distance: str: flank method: 'hamming' (substitutions) or 'levenshtein'
+               (substitutions and indels)
             -- max_len: int: reject longer sequences (0 = off; set by the code, not an option)
             -- min_len: int: reject shorter sequences (0 = off)
             -- allowed_lens: frozenset[int]: accepted lengths (empty = any length)
@@ -62,6 +76,7 @@ class ExtractSpec:
     up: str = ""
     down: str = ""
     flank_mismatch: int = 0
+    flank_distance: str = "hamming"
     max_len: int = 0
     min_len: int = 0
     allowed_lens: frozenset = field(default_factory=frozenset)
@@ -117,7 +132,9 @@ def spec_from_args(args, role, require_full_len, max_len=0):
     return ExtractSpec(role=role, method=method, start=opt("start"), length=opt("len"),
                        require_full_len=require_full_len,
                        up=(opt("up") or "").upper(), down=(opt("down") or "").upper(),
-                       flank_mismatch=args.flank_mismatch, max_len=max_len,
+                       flank_mismatch=args.flank_mismatch,
+                       flank_distance=getattr(args, "flank_distance", "hamming"),
+                       max_len=max_len,
                        min_len=opt("min_len"),
                        allowed_lens=parse_allowed_lens(opt("allowed_lens")),
                        template=(opt("temp") or "").upper(),
@@ -144,6 +161,8 @@ def validate_spec(spec):
         errors.append("--%s_up / --%s_down need the %s method flank" % (role, role, role))
     if spec.method == "flank" and not (spec.up and spec.down):
         errors.append("%s method flank needs --%s_up and --%s_down" % (role, role, role))
+    if spec.flank_distance not in FLANK_DISTANCES:
+        errors.append("--flank_distance must be one of %s" % ", ".join(FLANK_DISTANCES))
     # step2 : numbers and flanks
     for name, value in (("--%s_start" % role, spec.start), ("--%s_len" % role, spec.length),
                         ("--flank_mismatch", spec.flank_mismatch),
@@ -261,47 +280,123 @@ def reject_reason_order(barcode_spec, target_spec):
 
 # ---- sequence matching -----------------------------------------------------
 
-def within_hamming(seq, pattern, start, max_mismatch):
+def match_hamming_numpy(seq, pattern, max_mismatches):
     """
-    True when seq[start:start+len(pattern)] differs from pattern at <= max_mismatch positions.
+    First window of seq with <= max_mismatches Hamming mismatches to pattern (match_hamming_numpy
+    of sequence_utils.py): all windows are compared at once with numpy.  Only the windows up to
+    an exact match are compared (a later window cannot be the first one), same result.
     Parameters:
-            -- seq: bytes: sequence
-            -- pattern: bytes: pattern (must fit: start + len(pattern) <= len(seq))
-            -- start: int: position in seq
-            -- max_mismatch: int: mismatches allowed
+            -- seq: bytes: sequence to search in (upper case)
+            -- pattern: bytes: pattern to match (upper case)
+            -- max_mismatches: int: mismatches allowed
     Returns:
-            -- bool: True = match
+            -- int: start index of the match, or -1 if not found
     """
-    mismatches = 0
-    for i, base in enumerate(pattern):
-        if seq[start + i] != base:
-            mismatches += 1
-            if mismatches > max_mismatch:
-                return False
-    return True
+    k = len(pattern)
+    exact = seq.find(pattern)
+    if exact == 0 or max_mismatches == 0:
+        return exact
+    n = len(seq) if exact < 0 else exact + k                # windows 0 .. exact
+    if k > n:
+        return -1
+    # sliding window: a 2D view of seq of shape (n - k + 1, k)
+    windows = sliding_window_view(np.frombuffer(seq, dtype=np.uint8, count=n), window_shape=k)
+    mismatches = np.sum(windows != np.frombuffer(pattern, dtype=np.uint8), axis=1)
+    matches = np.where(mismatches <= max_mismatches)[0]
+    return int(matches[0]) if matches.size > 0 else -1
 
 
-def find_flank(seq, flank, max_mismatch, begin=0):
+def first_levenshtein_window(seq, pattern, max_mismatches, lo, hi):
     """
-    Position of a flanking sequence in seq, searching from `begin`.  An exact match is taken
-    first (fast C search); otherwise the first window with <= max_mismatch Hamming mismatches.
+    First window start i in [lo, hi) with edit distance(seq[i:i+k], pattern) <= max_mismatches.
+    A window that matches is also an infix alignment, so a range of windows is skipped when one
+    edlib infix (HW) search over it finds nothing; otherwise the range is halved.  Ranges of
+    <= 4 windows are checked window by window exactly as match_levenshtein does.
     Parameters:
-            -- seq: bytes: read sequence (upper case)
-            -- flank: bytes: flanking sequence (upper case)
-            -- max_mismatch: int: mismatches allowed
-            -- begin: int: first position searched
+            -- seq: bytes: sequence to search in
+            -- pattern: bytes: pattern to match
+            -- max_mismatches: int: edits allowed
+            -- lo / hi: int: range of window starts
     Returns:
-            -- int: start position of the flank, or -1 when not found
+            -- int: start index of the first matching window, or -1
     """
-    # step1 : exact match
-    pos = seq.find(flank, begin)
-    if pos >= 0 or max_mismatch == 0:
-        return pos
-    # step2 : first window within the mismatch limit
-    for pos in range(begin, len(seq) - len(flank) + 1):
-        if within_hamming(seq, flank, pos, max_mismatch):
-            return pos
-    return -1
+    k = len(pattern)
+    if hi - lo <= 4:
+        for i in range(lo, hi):
+            window = seq[i:i + k]
+            if edlib.align(window, pattern, mode="NW", k=max_mismatches)["editDistance"] != -1:
+                return i
+        return -1
+    if edlib.align(pattern, seq[lo:hi + k - 1], mode="HW", k=max_mismatches)["editDistance"] == -1:
+        return -1
+    mid = (lo + hi) // 2
+    first = first_levenshtein_window(seq, pattern, max_mismatches, lo, mid)
+    return first if first >= 0 else first_levenshtein_window(seq, pattern, max_mismatches, mid, hi)
+
+
+def match_levenshtein(seq, pattern, max_mismatches):
+    """
+    First window of seq (of the pattern length) whose Levenshtein distance to pattern is
+    <= max_mismatches (match_levenshtein of sequence_utils.py, edlib NW per window).  The same
+    windows are found in fewer edlib calls by first_levenshtein_window.
+    Parameters:
+            -- seq: bytes: sequence to search in (upper case)
+            -- pattern: bytes: pattern to match (upper case)
+            -- max_mismatches: int: edits allowed
+    Returns:
+            -- int: start index of the match, or -1 if not found
+    """
+    k = len(pattern)
+    n = len(seq)
+    if k > n:
+        return -1
+    return first_levenshtein_window(seq, pattern, max_mismatches, 0, n - k + 1)
+
+
+def match_approximate(seq, pattern, max_mismatches, distance):
+    """
+    Approximate match by Hamming or Levenshtein distance (match_approximate of sequence_utils.py).
+    Parameters:
+            -- seq: bytes: sequence to search in
+            -- pattern: bytes: pattern to match
+            -- max_mismatches: int: mismatches allowed
+            -- distance: str: 'hamming' or 'levenshtein'
+    Returns:
+            -- int: start index of the match, or -1 if not found
+    """
+    if distance == "hamming":
+        return match_hamming_numpy(seq, pattern, max_mismatches)
+    elif distance == "levenshtein":
+        return match_levenshtein(seq, pattern, max_mismatches)
+    else:
+        raise ValueError("Unknown distance metric: %s" % distance)
+
+
+def extract_sequence(seq, up_seq, down_seq, max_mismatches, distance):
+    """
+    Locate the sequence between approximate matches of up_seq and down_seq (extract_sequence of
+    sequence_utils.py; returns the slice instead of the substring).
+    Parameters:
+            -- seq: bytes: sequence to search in (upper case)
+            -- up_seq: bytes: upstream sequence to match
+            -- down_seq: bytes: downstream sequence to match
+            -- max_mismatches: int: mismatches allowed for both matches
+            -- distance: str: 'hamming' or 'levenshtein'
+    Returns:
+            -- tuple or str: (start, end) of the sequence, or 'upstream not found' /
+               'downstream not found'
+    """
+    start_idx = match_approximate(seq, up_seq, max_mismatches, distance)
+    if start_idx == -1:
+        return "upstream not found"
+    start_idx += len(up_seq)
+
+    end_idx = match_approximate(seq[start_idx:], down_seq, max_mismatches, distance)
+    if end_idx == -1:
+        return "downstream not found"
+    end_idx += start_idx
+
+    return start_idx, end_idx
 
 
 def matches_template(seq, start, end, fixed_bases, template_len, max_mismatch):
@@ -367,6 +462,8 @@ class SequenceExtractor:
         self.r_min_len = prefix + "below_min_len"
         self.r_length = prefix + "length_filtered"
         self.r_template = prefix + "template_mismatch"
+        self.flank_rejects = {"upstream not found": self.r_up,
+                              "downstream not found": self.r_down}
         self._span = {"none": self._span_whole, "pos": self._span_position,
                       "flank": self._span_flank}[spec.method]
 
@@ -397,21 +494,15 @@ class SequenceExtractor:
 
     def _span_flank(self, seq):
         """
-        Method flank: window between the upstream and the downstream flank.
+        Method flank: window between the upstream and the downstream flank (extract_sequence).
         Parameters:
                 -- seq: bytes: read sequence (upper case)
         Returns:
                 -- tuple or str: (start, end), or a reject key
         """
-        mismatch = self.spec.flank_mismatch
-        up = find_flank(seq, self.up, mismatch)
-        if up < 0:
-            return self.r_up
-        start = up + len(self.up)
-        end = find_flank(seq, self.down, mismatch, start)
-        if end < 0:
-            return self.r_down
-        return start, end
+        span = extract_sequence(seq, self.up, self.down, self.spec.flank_mismatch,
+                                self.spec.flank_distance)
+        return self.flank_rejects[span] if span.__class__ is str else span
 
     def span(self, seq):
         """

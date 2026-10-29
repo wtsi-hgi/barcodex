@@ -316,7 +316,9 @@ def describe_spec(spec):
     if spec.method == "pos":
         text = "pos: start %d, length %s" % (spec.start, spec.length or "to read end")
     elif spec.method == "flank":
-        text = "flank: %s / %s (<= %d mismatches)" % (spec.up, spec.down, spec.flank_mismatch)
+        text = "flank: %s / %s (<= %d mismatches, %s)" % (spec.up, spec.down,
+                                                           spec.flank_mismatch,
+                                                           spec.flank_distance)
     else:
         text = "none: whole read"
     if spec.min_len:
@@ -355,8 +357,9 @@ def stage_ingest(args, work, threads, mem_gb):
     S1: FASTQ -> compacted Parquet tuple store  <work>/tuples/t*.parquet.
     Starts one reader process per FASTQ role and the parse workers, supervises them, drives the
     background compaction and writes <out>.meta/ingest_stats.json and <work>/ingest.done.
-    Uses args: barcode_read, target_read, method, flank_mismatch, barcode_* / target_* options,
-    phred_offset, chunk, agg_entries, compact_parts, merge_files, max_reads, no_pigz.
+    Uses args: barcode_read, target_read, method, flank_mismatch, flank_distance,
+    barcode_* / target_* options, phred_offset, chunk, agg_entries, compact_parts, merge_files,
+    max_reads, no_pigz.
     Parameters:
             -- args: argparse.Namespace: parsed command line
             -- work: str: work directory

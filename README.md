@@ -9,10 +9,18 @@ Final map rules: one barcode -> exactly ONE target; one target -> MANY barcodes.
 
 ## Install and dependencies
 
-* Python >= 3.10 (tested with 3.10.10 and 3.11.2).
-* duckdb >= 1.2.2, < 2 (tested with 1.2.2). Everything else is the Python standard library.
-* pigz (optional, tested with 2.6) speeds up reading `.fastq.gz`. Without it, or with
-  `--no_pigz`, Python's gzip is used.
+Python >= 3.10 (tested with 3.10.10 and 3.11.2), and these packages:
+
+| package | version (tested) | used for |
+|---------|------------------|----------|
+| `duckdb` | >= 1.2.2, < 2 (1.2.2) | all out-of-core work: compaction (S1), barcode clustering (S2), sharding (S3), reading the shards (S4), target assignment and the output files (S5) |
+| `numpy`  | >= 1.20 (2.3.5) | flank method, `--flank_distance hamming`: compares the flank with every window of a read at once |
+| `edlib`  | >= 1.3 (1.3.9.post1) | flank method, `--flank_distance levenshtein`: edit distance (substitutions and indels) between the flank and a window |
+| `pytest` | optional | the tests use only `unittest`; pytest can run them too |
+
+Everything else is the Python standard library (argparse, multiprocessing, gzip, json, ...).
+pigz (optional system tool, tested with 2.6) speeds up reading `.fastq.gz`. Without it, or with
+`--no_pigz`, Python's gzip is used.
 
 The details are in `pyproject.toml`. On the farm, the HGI module has everything:
 
@@ -50,16 +58,31 @@ target between flanks, and `--method flank none` uses the whole target read.
 |---------|-----------------|---------------------------------------|
 | `none`  | the whole read | none |
 | `pos`   | a fixed window | `--*_start` (0-based), `--*_len` (0 = to the end of the read) |
-| `flank` | between two flanking sequences | `--*_up`, `--*_down`, and `--flank_mismatch` (shared by both, default 2) |
+| `flank` | between two flanking sequences | `--*_up`, `--*_down`, and `--flank_mismatch` (default 2) and `--flank_distance` (`hamming` or `levenshtein`, default `hamming`), both shared by barcode and target |
 
 * **pos**: a barcode read that is too short is rejected (`barcode_too_short`). A short target is
   kept as it is.
-* **flank**: the flanks are matched on the sequence only, without base qualities, with up to
-  `--flank_mismatch` Hamming mismatches. The downstream flank is searched after the upstream
-  flank. An exact flank match is used first; otherwise the first window within the mismatch
-  limit. This gave the same barcode / target / reject reason for every read as the reference
-  scripts: 100,000 reads against `associate_sequences.py` and 200,000 reads against
-  `associate_variant_barcode.py`.
+* **flank**: the flanks are found with the functions of `nf_starr_seq/scripts/sequence_utils.py`
+  (`extract_sequence`, `match_approximate`, `match_hamming_numpy`, `match_levenshtein`), ported
+  to barcodex with the same logic. They use the sequence only, without base qualities. The
+  upstream flank is searched first. The barcode / target starts `len(--*_up)` bases after the start
+  of the upstream match and ends where the downstream match starts (searched after the upstream
+  flank). `--flank_distance` (shared by barcode and target) chooses how a flank is matched:
+  * `hamming` (default, `match_hamming_numpy`): the first window, of the flank length, with at
+    most `--flank_mismatch` substitutions. numpy compares all windows at once. This gave the same
+    barcode / target / reject reason for every read as the reference scripts: 100,000 reads
+    against `associate_sequences.py` and 200,000 reads against `associate_variant_barcode.py`.
+  * `levenshtein` (`match_levenshtein`): the first window, of the flank length, whose edit distance
+    to the flank (substitutions and indels, edlib) is at most `--flank_mismatch`.
+  * Both give the same window as the `sequence_utils.py` functions; this was checked on 50,000
+    (Hamming) and 5,000 (Levenshtein) combi_6 reads and on random reads in the unit tests.
+    barcodex only makes them faster without changing the result: Hamming compares only the
+    windows up to an exact match, and Levenshtein skips ranges of windows that an edlib infix
+    search shows cannot match (40-65 µs per read instead of 800).
+  * Because the window has the flank length, Levenshtein results can differ from what you might
+    expect. A 1-base deletion in a flank costs 2 edits: the deletion, plus one more base pulled
+    into the window. Also, with `--flank_mismatch 2` the window one base before an exact flank
+    already matches (one deletion and one insertion), so the match starts one base early.
 * An option of another method is an error, for example `--method none none --barcode_len 16`.
 
 Filters, for any method:
@@ -148,6 +171,15 @@ carried that sequence.
 | `first_barcode_cov`, `first_barcode_ratio` | reads of the most abundant raw barcode, and its fraction of `barcode_reads` |
 | `second_barcode_cov`, `second_barcode_ratio` | the same for the second most abundant raw barcode (0 if none) |
 
+Example (combi_6; the 180 bp targets are shortened here with `...`):
+
+```
+barcode	target	barcode_reads	n_diff_barcodes	first_barcode_cov	first_barcode_ratio	second_barcode_cov	second_barcode_ratio
+ATACATTGTTATTGTGATTAACATTAGGATAGATATTT	GATACACTATGG...GGCACGGGTGAGG	7515	36	7436	0.9895	19	0.0025
+ATAGATTGTTATTTATATGAAAATTGCGATCGGCATAA	GAATGTCACGGT...GCTCACGGATTTTACT	4319	24	4285	0.9921	6	0.0014
+CTTGATTCACATTTTTATGTGAATCTGCATATGGATAT	GAGTAGTCTTCG...GCCGAGGCATAGGGCGTGGG	3793	10	3781	0.9968	2	0.0005
+```
+
 `<prefix>.target_clusters.tsv` has one row per final (barcode, target) pair:
 
 | column | meaning |
@@ -158,8 +190,37 @@ carried that sequence.
 | `first_target_cov`, `first_target_ratio` | reads of the most abundant target sequence, and its fraction of `target_reads` |
 | `second_target_cov`, `second_target_ratio` | the same for the second most abundant target sequence |
 
+Example (the same barcodes):
+
+```
+barcode	target	target_reads	n_diff_targets	first_target_cov	first_target_ratio	second_target_cov	second_target_ratio
+ATACATTGTTATTGTGATTAACATTAGGATAGATATTT	GATACACTATGG...GGCACGGGTGAGG	7392	720	6283	0.85	55	0.0074
+ATAGATTGTTATTTATATGAAAATTGCGATCGGCATAA	GAATGTCACGGT...GCTCACGGATTTTACT	4206	442	3511	0.8348	33	0.0078
+CTTGATTCACATTTTTATGTGAATCTGCATATGGATAT	GAGTAGTCTTCG...GCCGAGGCATAGGGCGTGGG	3779	257	3310	0.8759	34	0.009
+```
+
+`target_reads` can be smaller than `barcode_reads`: reads of the barcode that support other
+(minor) targets are not counted (`reads_minor_targets` in the stats).
+
 `<prefix>.stats.tsv` has the columns `step`, `stat`, `value`, `percent` and `description`. The
-rows are ordered by step:
+rows are ordered by step. Example (combi_6, a few rows of each step):
+
+```
+step	stat	value	percent	description
+1_input	total_read_pairs	93586470	100.00	read pairs in the FASTQ files
+2_extraction	target_upstream_not_found	7871550	8.41	read pairs rejected: upstream flank (--target_up) not found
+2_extraction	barcode_template_mismatch	3820687	4.08	read pairs rejected: barcode does not match --barcode_temp NNNNATNNNNATNNNNATNNNNATNNNNATNNNNATNN
+2_extraction	extracted_read_pairs	73213797	78.23	read pairs with a valid barcode and target
+3_barcode_clustering	raw_barcodes	3810506	NA	distinct barcode sequences before clustering
+3_barcode_clustering	barcode_clusters	2581093	NA	barcode clusters with reads after clustering
+4_target_clustering	barcode_target_clusters	5024288	NA	(barcode cluster, target cluster) pairs after target clustering
+5_target_assignment	barcodes_ambiguous	36448	NA	top target has < 0.8 of the barcode's reads (--min_purity): dropped
+6_final_map	final_barcodes	2534431	NA	barcodes in the final barcode -> target map
+6_final_map	effective_reads	69896857	74.69	reads supporting the final (barcode, target) pairs
+6_final_map	barcode_coverage_median	23	NA	median reads per final barcode (after clustering)
+```
+
+All rows:
 
 | step | stats |
 |------|-------|
@@ -188,13 +249,15 @@ Also in the output directory:
 * `<prefix>.meta/`: the intermediate files for `--resolve_only`. You can delete it, or use
   `--clean_meta`.
 * Optional: `<prefix>.barcode_map.tsv` (`--barcode_map`) and `<prefix>_barcode.fastq` /
-  `<prefix>_target.fastq` (`--fastq`).
+  `<prefix>_target.fastq` (`--fastq`). The barcode map has one row per raw barcode kept by the
+  barcode clustering (dropped barcodes are not listed), with the columns `barcode`, `reads` and
+  `centre_barcode` (the cluster centre it was merged into).
 
 ## Tests
 
 | test file | what it covers |
 |-----------|----------------|
-| `test_extract.py` | none / pos / flank extraction, length and template filters |
+| `test_extract.py` | none / pos / flank extraction (Hamming and Levenshtein flanks), length and template filters |
 | `test_cli.py` | options, `--method`, validation, `cmd.log`, `--version` |
 | `test_s1_ingest.py` | FASTQ reader, read parsing and reject order, part files, compaction, step S1 |
 | `test_s2_s3_barcodes_shards.py` | barcode clustering (S2) and sharding (S3) |
