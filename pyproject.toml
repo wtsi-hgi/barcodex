@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "barcodex"
+version = "0.1"
+description = "Out-of-core, quality-aware barcode -> target association for very large paired-end data sets"
+readme = "README.md"
+authors = [{ email = "fs18@sanger.ac.uk" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+# Tested with Python 3.10.10 and 3.11.2 (HGI softpack nf_starr_seq / nf_splicing_py).
+requires-python = ">=3.10"
+
+# Python packages
+#   duckdb   all out-of-core work: compaction (S1), barcode clustering (S2), sharding (S3),
+#            reading the shards (S4), target assignment and output files (S5).
+#            Needs the SQL functions hamming, levenshtein, bit_count, xor, hash, arg_min and
+#            COPY ... PARTITION_BY; tested with 1.2.2.
+#   Everything else is the Python standard library (argparse, multiprocessing, gzip, json, ...).
+dependencies = [
+    "duckdb>=1.2.2,<2",
+]
+
+# Optional system tool (not a Python package; found on PATH)
+#   pigz     parallel gunzip of .fastq.gz input, much faster than Python's gzip
+#            (tested with pigz 2.6); switched off with --no_pigz, gzip is used without it.
+
+[project.optional-dependencies]
+# the tests use only unittest (python -m unittest discover -s tests); pytest can run them too
+test = ["pytest>=7"]
+
+[project.scripts]
+barcodex = "barcodex.cli:main"
+
+[tool.setuptools]
+packages = ["barcodex"]
