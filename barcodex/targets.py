@@ -12,6 +12,11 @@ from .common import log, log_sub, meta_path, open_duckdb, sql_str
 from .constants import COST_SCALE
 from .distance import BASE_TO_DIGIT, lane_mask, mate_cost, popcount, unpack_seq
 
+# S4 DuckDB memory per worker: at least S4_MIN_MEM_GB and S4_MEM_PER_SHARD_GB x the largest shard
+# (ORDER BY centre over one shard; 1.4 GB failed on a 1.9 GB shard of 150 bp strings)
+S4_MIN_MEM_GB = 2.0
+S4_MEM_PER_SHARD_GB = 3.0
+
 # ---- clustering the target variants of ONE barcode --------------------
 
 # Per-process state of the S4 worker pool (filled by init_s4_worker).
@@ -362,16 +367,26 @@ def stage_targets(args, work, threads, mem_gb, n_shards):
     # step1 : settings that every worker process receives (S4_STATE)
     ctx = mp.get_context("spawn")
     use_quality = args.target_max_lowq > 0
+    #      |----   substep each worker sorts a whole shard in DuckDB: give it >= S4_MEM_PER_SHARD_GB x the
+    #      |----   substep largest shard on disk (compressed Parquet), and run fewer workers if needed
+    largest_gb = max([sum(os.path.getsize(path) for path in glob.glob(d + "/*.parquet"))
+                      for d in glob.glob(work + "/shards/shard=*")] or [0]) / 1e9
+    need_gb = max(S4_MIN_MEM_GB, S4_MEM_PER_SHARD_GB * largest_gb)
+    workers = max(1, min(threads, int(mem_gb * 0.7 / need_gb)))
+    if workers < threads:
+        log_sub("largest shard %.2f GB: %d S4 worker(s) with %.1f GB DuckDB memory each "
+                "(more --mem_gb or --shards allows more workers)"
+                % (largest_gb, workers, mem_gb * 0.7 / workers))
     cfg = dict(work=work, fastq=args.fastq, keep_tmp=args.keep_tmp,
                max_parents=max(1, args.max_parents), max_dp_group=args.max_dp_group,
-               s4_mem_gb=max(0.5, mem_gb * 0.7 / threads),
+               s4_mem_gb=max(0.5, mem_gb * 0.7 / workers),
                params=(args.target_dist, args.target_max_lowq,
                        min(args.target_max_indel, args.target_dist),
                        max(args.target_ratio, 1.0), max(args.target_lowq_ratio, 1.0),
                        use_quality))
     # step2 : cluster the shards in parallel (one shard per task) and add up the counters
     n_barcodes = n_clusters = n_reads = n_done = 0
-    for barcodes_i, clusters_i, reads_i in run_pool(ctx, threads, process_shard,
+    for barcodes_i, clusters_i, reads_i in run_pool(ctx, workers, process_shard,
                                                     list(range(n_shards)),
                                                     init_s4_worker, (cfg,)):
         n_barcodes += barcodes_i
