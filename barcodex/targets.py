@@ -220,12 +220,17 @@ def run_groups(rows, out_clusters, out_barcode_fq, out_target_fq, params, long_g
     for centre, target, count, tm0, tm1, tm2, tm3 in rows:
         #      |----   substep a new centre starts: cluster and write the previous barcode first
         if centre != current:                       # rows are sorted: new barcode starts here
-            if current is not None:
+            if items:
                 emit(current, items)
             current = centre
             items = []
-        #      |----   substep pack the target: 2 bits per base + one length byte
+        #      |----   substep skip corrupt targets (non-ACGT bytes cannot be packed; ingest writes ACGT only)
         target_bytes = target.encode()
+        if target_bytes.translate(None, b"ACGT"):
+            log_sub("WARNING: skipped a target with non-ACGT bytes (barcode %s, %d reads): %r"
+                    % (centre, count, target_bytes))
+            continue
+        #      |----   substep pack the target: 2 bits per base + one length byte
         length = len(target_bytes)
         # sequence -> integer digits 0..3 -> packed bytes, plus the length as last byte
         digits = target_bytes.translate(BASE_TO_DIGIT)
@@ -242,7 +247,7 @@ def run_groups(rows, out_clusters, out_barcode_fq, out_target_fq, params, long_g
             mask ^= lowest
         items.append((count, key, bytes(positions)))
     # step3 : write the last barcode and return the totals
-    if current is not None:
+    if items:
         emit(current, items)
     return state["n_barcodes"], state["n_clusters"], state["n_reads"]
 
