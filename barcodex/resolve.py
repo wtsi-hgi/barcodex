@@ -100,13 +100,16 @@ def assign_targets(con, args):
             -- None: nothing; creates the tables
     """
     # step1 : target ids T00000001, ... (most reads first)
+    #   lpad truncates longer strings, so the width must hold the largest id (> 99,999,999 targets)
+    n_roots = con.execute("SELECT COUNT(DISTINCT root) FROM tmap").fetchone()[0]
+    width = max(8, len(str(n_roots)))
     con.execute("""
         CREATE OR REPLACE TABLE target_ids AS
         SELECT root AS target_seq,
-               'T' || lpad(CAST(ROW_NUMBER() OVER (ORDER BY reads DESC, root) AS VARCHAR), 8, '0') AS target_id
+               'T' || lpad(CAST(ROW_NUMBER() OVER (ORDER BY reads DESC, root) AS VARCHAR), {w}, '0') AS target_id
         FROM (SELECT m.root, SUM(t.reads) AS reads
               FROM tmap m JOIN tseq t USING (target) GROUP BY m.root)
-    """)
+    """.format(w=width))
 
     # step2 : reads per (barcode, target id)
     #   pair_reads = reads of the pair after target clustering, n_variants = number of
@@ -122,14 +125,19 @@ def assign_targets(con, args):
     """)
 
     # step3 : ONE target per barcode and its status
+    #   GROUP BY + arg_min instead of a window over all barcodes: the out-of-core window corrupted
+    #   strings on the full data set (DuckDB 1.2.2 "Invalid unicode ... segment statistics update")
     log_sub("choosing one target per barcode")
     con.execute("""
         CREATE OR REPLACE TABLE barcode_assign AS
         WITH r AS (
-            SELECT *,
-                   ROW_NUMBER() OVER (PARTITION BY barcode ORDER BY pair_reads DESC, target_id) AS rn,
-                   COUNT(*)     OVER (PARTITION BY barcode) AS n_targets
-            FROM bt)
+            SELECT barcode,
+                   arg_min(target_id, (-pair_reads, target_id))  AS target_id,
+                   MAX(pair_reads)                               AS pair_reads,
+                   MAX(barcode_reads)                            AS barcode_reads,
+                   arg_min(n_variants, (-pair_reads, target_id)) AS n_variants,
+                   COUNT(*)                                      AS n_targets
+            FROM bt GROUP BY barcode)
         SELECT r.barcode, r.target_id, i.target_seq,
                r.pair_reads, r.barcode_reads, r.n_variants,
                r.pair_reads * 1.0 / r.barcode_reads AS purity,
@@ -139,7 +147,6 @@ def assign_targets(con, args):
                     WHEN r.n_targets > 1                                THEN 'resolved'
                     ELSE 'unique' END AS status
         FROM r JOIN target_ids i USING (target_id)
-        WHERE r.rn = 1
     """.format(mp=int(args.min_pair_reads), pur=float(args.min_purity)))
     #      |----   substep report the number of barcodes per status
     for status, n in con.execute(
@@ -183,15 +190,13 @@ def write_cluster_files(con, args, barcode_meta):
                 "JOIN target_ids i ON m.root = i.target_seq "
                 "JOIN final f ON f.barcode = p.barcode AND f.target_id = i.target_id %s"
                 % (column, extra_filter))
+    #      |----   substep MAX(cov, 2) = the two largest coverages, largest first (no window, see assign_targets)
     con.execute("""
         CREATE OR REPLACE TABLE final_cov AS
-        SELECT barcode, target_id,
-               MAX(cov) FILTER (WHERE rn = 1) AS first_cov,
-               COALESCE(MAX(cov) FILTER (WHERE rn = 2), 0) AS second_cov
-        FROM (SELECT barcode, target_id, cov,
-                     ROW_NUMBER() OVER (PARTITION BY barcode, target_id ORDER BY cov DESC) AS rn
-              FROM (%s UNION ALL %s))
-        GROUP BY barcode, target_id
+        SELECT barcode, target_id, top2[1] AS first_cov, COALESCE(top2[2], 0) AS second_cov
+        FROM (SELECT barcode, target_id, MAX(cov, 2) AS top2
+              FROM (%s UNION ALL %s)
+              GROUP BY barcode, target_id)
     """ % (variant_rows("first_cov"), variant_rows("second_cov", "WHERE p.second_cov > 0")))
 
     # step2 : barcode clustering file: one row per final barcode
