@@ -285,7 +285,7 @@ def resolve_pairs(args, threads):
     log_sub("loading (barcode, target cluster) pairs")
     con.execute("""
         CREATE OR REPLACE TABLE pairs AS
-        SELECT * FROM read_csv(%s, delim='\t', header=true, columns={
+        SELECT * FROM read_csv(%s, delim='\t', header=true, quote='', escape='', columns={
             'barcode':'VARCHAR', 'barcode_reads':'BIGINT', 'target_rank':'INTEGER',
             'target_reads':'BIGINT', 'target_unique':'INTEGER', 'target_seq':'VARCHAR',
             'first_cov':'BIGINT', 'second_cov':'BIGINT'})
