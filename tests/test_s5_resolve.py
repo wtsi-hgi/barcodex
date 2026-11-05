@@ -110,5 +110,39 @@ class TestResolve(TempDirTestCase):
         self.assertEqual((number(None), number(3.0), number(2.345)), ("0", "3", "2.35"))
 
 
+class TestResolveMerge(TempDirTestCase):
+
+    def test_merge_targets_across_barcodes(self):
+        """--merge_dist 1: the 1-mismatch variant ACGTACGTAA joins the more abundant ACGTACGTAC."""
+        args = make_args(os.path.join(self.tmp, "out"), merge_dist=1, merge_ratio=1.0)
+        os.makedirs(meta_path(args))
+        # barcode, barcode_reads, rank, target_reads, target_unique, target, first_cov, second_cov
+        rows = [("BC_1", 13, 1, 10, 1, "ACGTACGTAC", 10, 0),
+                ("BC_1", 13, 2, 3, 2, "ACGTACGTAA", 2, 1),
+                ("BC_2", 4, 1, 4, 1, "ACGTACGTAA", 4, 0)]
+        with open(meta_path(args, "target_pairs.tsv"), "w") as fo:
+            fo.write(PAIR_HEADER)
+            for r in rows:
+                fo.write("%s\t%d\t%d\t%d\t%d\t%s\t%d\t%d\n" % r)
+        con = duckdb.connect()
+        con.execute("COPY (SELECT * FROM (VALUES ('BC_1', 13, 1, 13, 0), ('BC_2', 4, 1, 4, 0)) "
+                    "v(barcode, count, n_cluster, first_cov, second_cov)) TO '%s' (FORMAT PARQUET)"
+                    % meta_path(args, "barcode_clusters.parquet"))
+        con.close()
+        with open(meta_path(args, "raw_stats.json"), "w") as fo:
+            json.dump({"raw_barcodes": 2, "raw_targets": 2, "reads_in": 17, "reads_clustered": 17}, fo)
+        resolve_pairs(args, 1)
+        targets = {r["barcode"]: r for r in read_tsv(args.out + ".target_clusters.tsv")}
+        self.assertEqual(sorted(targets), ["BC_1", "BC_2"])
+        # BC_1: both clusters merged -> 13 reads, 3 variants, top two coverages 10 and 2
+        self.assertEqual({k: targets["BC_1"][k] for k in ("target", "target_reads", "n_diff_targets",
+                                                          "first_target_cov", "second_target_cov")},
+                         {"target": "ACGTACGTAC", "target_reads": "13", "n_diff_targets": "3",
+                          "first_target_cov": "10", "second_target_cov": "2"})
+        # BC_2 only saw the variant: it is reported as the root sequence
+        self.assertEqual((targets["BC_2"]["target"], targets["BC_2"]["target_reads"]),
+                         ("ACGTACGTAC", "4"))
+
+
 if __name__ == "__main__":
     unittest.main()

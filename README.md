@@ -9,11 +9,11 @@ Final map rules: one barcode -> exactly ONE target; one target -> MANY barcodes.
 
 ## Install and dependencies
 
-Python >= 3.10 (tested with 3.10.10 and 3.11.2), and these packages:
+Python >= 3.11 (tested with 3.11.2; DuckDB 2 needs 3.11), and these packages:
 
 | package | version (tested) | used for |
 |---------|------------------|----------|
-| `duckdb` | >= 1.2.2, < 2 (1.2.2) | all out-of-core work: compaction (S1), barcode clustering (S2), sharding (S3), reading the shards (S4), target assignment and the output files (S5) |
+| `duckdb` | >= 2.0 (2.0.0) | all out-of-core work: compaction (S1), barcode clustering (S2), sharding (S3), reading the shards (S4), target assignment and the output files (S5) |
 | `numpy`  | >= 1.20 (2.3.5) | flank method, `--flank_distance hamming`: compares the flank with every window of a read at once |
 | `edlib`  | >= 1.3 (1.3.9.post1) | flank method, `--flank_distance levenshtein`: edit distance (substitutions and indels) between the flank and a window |
 | `pytest` | optional | the tests use only `unittest`; pytest can run them too |
@@ -25,7 +25,7 @@ pigz (optional system tool, tested with 2.6) speeds up reading `.fastq.gz`. With
 The details are in `pyproject.toml`. On the farm, the HGI module has everything:
 
 ```bash
-module load HGI/softpack/users/fs18/nf_splicing_py
+module load HGI/softpack/users/fs18/nf_starr_seq
 ```
 
 `pip install .` in this directory installs the package and a `barcodex` command.
@@ -144,7 +144,7 @@ python run_barcodex.py --barcode_read combi_6.extendedFrags.fastq.gz \
 | S2 barcodes | `barcodes.py` | DuckDB barcode census. Barcodes with enough reads ("heavy" barcodes) can be parents. Each barcode is matched to a parent with a pigeonhole seed join and a quality-aware Hamming or Levenshtein distance. Chains of parents are followed to the root by pointer jumping. |
 | S3 shards   | `shards.py` | Replaces each barcode by its cluster centre and writes Hive-partitioned shards by hash(centre). |
 | S4 targets  | `distance.py`, `targets.py` | Clusters the targets of each barcode, quality-aware, with one process per shard. |
-| S5 resolve  | `resolve.py`, `stats.py` | Chooses one target per barcode and writes the result files and the stats. `--resolve_only` re-runs only S5. |
+| S5 resolve  | `resolve.py`, `stats.py` | Chooses one target per barcode and writes the result files and the stats. Its tables hold no sequences: barcodes and targets are keyed by `md5_number()`, and the sequences are read again from `target_pairs.tsv` only while the result files are written. `--resolve_only` re-runs only S5. |
 
 Other modules:
 
@@ -262,7 +262,7 @@ Also in the output directory:
 | `test_s1_ingest.py` | FASTQ reader, read parsing and reject order, part files, compaction, step S1 |
 | `test_s2_s3_barcodes_shards.py` | barcode clustering (S2) and sharding (S3) |
 | `test_s4_targets.py` | edit distance, target clustering within a barcode, step S4 |
-| `test_s5_resolve.py` | one target per barcode, output columns, stats file by step |
+| `test_s5_resolve.py` | one target per barcode, output columns, stats file by step, `--merge_dist` |
 | `test_all_steps.py` | all steps on synthetic data (`pos none` and `flank pos` scenarios) |
 
 ## Code conventions

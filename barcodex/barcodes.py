@@ -472,23 +472,22 @@ def stage_barcodes(args, work, threads, mem_gb):
     #   count      = reads of all barcodes merged into the cluster (coverage after clustering)
     #   n_cluster  = number of different raw barcodes in the cluster
     #   first_cov  = reads of the most abundant barcode, second_cov = of the second one (0 if none)
-    # Clusters with a heavy centre are grouped by integer id (narrow rows, no strings);
-    # light barcodes that are their own centre are clusters of size 1.
+    # Clusters with a heavy centre are grouped by integer id (narrow rows, no strings; the two
+    # largest counts by max(n, 2), no window sort); light barcodes that are their own centre are
+    # clusters of size 1.
     #      |----   substep meta/barcode_clusters.parquet: count, n_cluster, first_cov, second_cov per centre
     con.execute("""
         COPY (
             SELECT c.b AS barcode, g."count" AS "count", g.n_cluster AS n_cluster,
                    g.first_cov AS first_cov, g.second_cov AS second_cov
             FROM (SELECT root_id, SUM(n)::BIGINT AS "count", COUNT(*)::BIGINT AS n_cluster,
-                         MAX(n) FILTER (WHERE rn = 1)::BIGINT AS first_cov,
-                         COALESCE(MAX(n) FILTER (WHERE rn = 2), 0)::BIGINT AS second_cov
-                  FROM (SELECT root_id, n,
-                               ROW_NUMBER() OVER (PARTITION BY root_id ORDER BY n DESC) AS rn
-                        FROM (SELECT r.root_id AS root_id, h.n AS n
-                              FROM heavy h JOIN hroot r ON r.hid = h.hid
-                              UNION ALL
-                              SELECT r.root_id AS root_id, m.n AS n
-                              FROM lmatch m JOIN hroot r ON r.hid = m.parent_id))
+                         MAX(n)::BIGINT AS first_cov,
+                         COALESCE((max(n, 2))[2], 0)::BIGINT AS second_cov
+                  FROM (SELECT r.root_id AS root_id, h.n AS n
+                        FROM heavy h JOIN hroot r ON r.hid = h.hid
+                        UNION ALL
+                        SELECT r.root_id AS root_id, m.n AS n
+                        FROM lmatch m JOIN hroot r ON r.hid = m.parent_id)
                   GROUP BY root_id) g
             JOIN heavy c ON c.hid = g.root_id
             UNION ALL

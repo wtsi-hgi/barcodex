@@ -15,7 +15,7 @@ The read counts add up:
                          + reads_minor_targets (5) + effective_reads (6)
 """
 
-from .common import log_sub, sql_str
+from .common import log_sub
 
 STEPS = ("1_input", "2_extraction", "3_barcode_clustering", "4_target_clustering",
          "5_target_assignment", "6_final_map")
@@ -162,19 +162,17 @@ def assignment_stats(con, args):
     ]
 
 
-def final_map_stats(con, barcode_meta):
+def final_map_stats(con):
     """
     Step 6: the final barcode -> target map.
     Parameters:
-            -- con: duckdb connection with table final
-            -- barcode_meta: str: <out>.meta/barcode_clusters.parquet
+            -- con: duckdb connection with table final (bc_count = reads of the barcode cluster, S2)
     Returns:
             -- list[Stat]: rows
     """
     # step1 : barcodes, targets, pairs and reads
-    n_barcodes, bc_mean, bc_median = con.execute("""
-        SELECT COUNT(*), AVG(m."count"), median(m."count")
-        FROM final f JOIN read_parquet(%s) m ON m.barcode = f.barcode""" % sql_str(barcode_meta)).fetchone()
+    n_barcodes, bc_mean, bc_median = con.execute(
+        "SELECT COUNT(*), AVG(bc_count), median(bc_count) FROM final").fetchone()
     n_targets, tg_mean, tg_median = con.execute("""
         SELECT COUNT(*), AVG(reads), median(reads)
         FROM (SELECT target_id, SUM(pair_reads) AS reads FROM final GROUP BY target_id)""").fetchone()
@@ -203,12 +201,11 @@ def final_map_stats(con, barcode_meta):
 
 # ---- all rows and the file -------------------------------------------------
 
-def collect_stats(con, barcode_meta, raw_stats, ingest_stats, args):
+def collect_stats(con, raw_stats, ingest_stats, args):
     """
     All rows of the stats file, ordered by step.
     Parameters:
             -- con: duckdb connection after assign_targets (tables pairs, final, barcode_assign)
-            -- barcode_meta: str: <out>.meta/barcode_clusters.parquet
             -- raw_stats: dict: content of raw_stats.json (S2)
             -- ingest_stats: dict or None: content of ingest_stats.json (S1)
             -- args: argparse.Namespace: min_pair_reads, min_purity
@@ -217,7 +214,7 @@ def collect_stats(con, barcode_meta, raw_stats, ingest_stats, args):
     """
     return (extraction_stats(ingest_stats) + barcode_clustering_stats(con, raw_stats)
             + target_clustering_stats(con, raw_stats) + assignment_stats(con, args)
-            + final_map_stats(con, barcode_meta))
+            + final_map_stats(con))
 
 
 def write_stats(path, stats):

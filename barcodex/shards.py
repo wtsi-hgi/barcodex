@@ -31,13 +31,16 @@ def stage_shards(args, work, threads, mem_gb, n_shards):
     shutil.rmtree(shards_dir, ignore_errors=True)
     con = open_duckdb(work, threads, mem_gb * 0.85, "shard")
     # step2 : tuples JOIN barcode map -> (centre, target) rows; counts add, masks AND; write shards by hash(centre)
+    #   the join key is md5_number(barcode) (128 bit): the hash table holds no barcode strings
     n_rows = con.execute("""
         COPY (
             SELECT m.centre AS centre, t.target AS target, SUM(t.cnt)::UBIGINT AS cnt,
                    bit_and(t.tm0) AS tm0, bit_and(t.tm1) AS tm1,
                    bit_and(t.tm2) AS tm2, bit_and(t.tm3) AS tm3,
                    (hash(m.centre) %% %d)::INTEGER AS shard
-            FROM read_parquet(%s) t JOIN read_parquet(%s) m ON t.barcode = m.barcode
+            FROM read_parquet(%s) t
+            JOIN (SELECT md5_number(barcode) AS bk, centre FROM read_parquet(%s)) m
+              ON md5_number(t.barcode) = m.bk
             GROUP BY m.centre, t.target
         ) TO %s (FORMAT PARQUET, PARTITION_BY (shard), COMPRESSION ZSTD)
     """ % (n_shards, sql_str(work + "/tuples/t*.parquet"), sql_str(work + "/bcmap.parquet"),
