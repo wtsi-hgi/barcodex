@@ -1,10 +1,11 @@
 """
-S2 barcodes: tuples -> centre barcode of every barcode  (<work>/bcmap.parquet).
+Step 2 -- processing barcodes: 
+Clustering barcodes by sequence similarity and abundance, then mapping every barcode to its cluster centre.
 
-Parents are barcodes with count >= --barcode_ratio (the "heavy" set).  Every barcode is matched
-to heavy parents by pigeonhole-seed JOIN + quality-aware Hamming (or Levenshtein for indels).
-Best parent = smallest (hard, low) distance, then largest count.  Chains are resolved by pointer
-jumping on the heavy set only.
+1. The parental barcodes are the ones with count >= --barcode_ratio (the "heavy" set). 
+2. Every barcode is matched to its parents by pigeonhole-seed JOIN + quality-aware Hamming (or Levenshtein for indels).
+
+SQL builders: packed barcodes, seed join, ranking, matching queries
 """
 
 import json
@@ -13,44 +14,49 @@ import os
 from .common import log, log_sub, meta_path, open_duckdb, sql_str
 from .constants import COST_SCALE, MAX_QUAL_BARCODE_LEN, MIN_SEED_LEN
 
-# ---- SQL builders: packed barcodes, seed join, ranking, matching queries ---
 
 def packed_barcode_sql(max_len, fixed_len):
     """
-    SQL expressions (code_expr, conf_expr) built from the columns  b  (barcode) and  bm
-    (low-quality mask, bit = 1 for low quality).  Each barcode becomes two 64-bit words:
-      code : 2 bits per base (A=0 C=1 G=2 T=3), first base in the highest lane
-      conf : one bit in the LOW bit of each lane, 1 = confident base
-    so that  hard = bit_count(((x | x >> 1) & conf1 & conf2)),  x = code1 xor code2.
-    When all barcodes have the same length (fixed_len) the shifts are constants (much faster).
+    To speed up the quality-aware matching, every barcode is packed into two 64-bit words (code_expr, conf_expr)
+    code_expr is the barcode and conf_expr is the low-quality mask. The SQL expressions below compute these two words
+        code_expr: 2 bits per base (A=0 C=1 G=2 T=3)
+        conf_expr: one bit, 1 = confident, 0 = low quality
+
+    Note: first base in the highest lane
+    
+    hard = bit_count(((x | x >> 1) & conf1 & conf2)),  x = code1 xor code2.
+
+    All barcodes must have the same length (fixed_len) for the shifts to be constants (much faster).
+
     Parameters:
-            -- max_len: int: longest barcode (at most MAX_QUAL_BARCODE_LEN = 32)
-            -- fixed_len: int: common length of all barcodes, or 0 if the lengths differ
+        -- max_len: int: longest barcode (at most MAX_QUAL_BARCODE_LEN = 32)
+        -- fixed_len: int: common length of all barcodes, or 0 if the lengths differ
     Returns:
-            -- tuple: (code_expr, conf_expr), two SQL expression strings returning UBIGINT
+        -- tuple: (code_expr, conf_expr), two SQL expression strings returning UBIGINT
     """
     # step1 : one term per base position: a 2-bit code lane and a 1-bit confidence lane
     code_terms, conf_terms = [], []
     for i in range(max_len):
-        #      |----   substep constant shifts when all barcodes have the same length, else shifts computed from length(b)
+        #    |---- substep constant shifts when all barcodes have the same length, else shifts computed from length(b)
         if fixed_len:
             bit_shift = "%d" % (fixed_len - 1 - i)
             lane_shift = "%d" % (2 * (fixed_len - 1 - i))
         else:
             bit_shift = "greatest(length(b) - 1 - %d, 0)" % i
             lane_shift = "(2 * %s)" % bit_shift
-        #      |----   substep code lane: A=0 C=1 G=2 T=3 (anything else = 0)
+        #    |---- substep code lane: A=0 C=1 G=2 T=3 (anything else = 0)
         code = ("(CASE substr(b, %d, 1) WHEN 'C' THEN 1 WHEN 'G' THEN 2 WHEN 'T' THEN 3 ELSE 0 END)"
                 "::UBIGINT << (%s)::UBIGINT" % (i + 1, lane_shift))
-        #      |----   substep confidence lane: 1 when the mask bit of the base is 0 (confident)
+        #    |---- substep confidence lane: 1 when the mask bit of the base is 0 (confident)
         conf = ("(1::UBIGINT - ((bm >> (%s)::UBIGINT) & 1::UBIGINT)) << (%s)::UBIGINT"
                 % (bit_shift, lane_shift))
-        #      |----   substep variable length: positions beyond the barcode end contribute 0
-        if not fixed_len:                                   # position beyond the barcode end
+        #    |---- substep variable length: positions beyond the barcode end contribute 0
+        if not fixed_len:
             code = "CASE WHEN length(b) > %d THEN %s ELSE 0::UBIGINT END" % (i, code)
             conf = "CASE WHEN length(b) > %d THEN %s ELSE 0::UBIGINT END" % (i, conf)
         code_terms.append("(%s)" % code)
         conf_terms.append("(%s)" % conf)
+    
     # step2 : OR all lane terms together into two 64-bit words
     return ("(%s)::UBIGINT" % " | ".join(code_terms),
             "(%s)::UBIGINT" % " | ".join(conf_terms))
@@ -58,22 +64,32 @@ def packed_barcode_sql(max_len, fixed_len):
 
 def seed_join_parts(src, seed_len, n_seeds, band):
     """
-    Pieces shared by both matching queries (pigeonhole seed join).
-    The barcode is cut into n_seeds slots of seed_len bases.  Two barcodes with at most
-    n_seeds-1 differences must share one slot exactly.  With indels the seed may sit up to `band`
-    bases away from its slot, so the child is probed at every shift.  The seed is compared as a
-    64-bit HASH (not as a string): the heavy-barcode seed index then holds only integers and fits
-    in memory even for 10^8 heavy barcodes.  A hash collision only creates an extra candidate,
-    which the distance filter rejects.
+    Shared logic used by both barcode-matching queries (pigeonhole seed join).
+
+    Each barcode is divided into n_seeds non-overlapping sections (seeds), with each seed containing seed_len bases
+
+    The pigeonhole principle guarantees that if two barcodes differ at no more than (n_seeds - 1) positions, at least 
+    one corresponding seed must be identical.
+
+    When insertions or deletions (indels) are allowed, the position of a seed may shift relative to its expected 
+    position. We search for the matching seed at every possible offset within band bases of its expected position.
+
+    For faster searching and lower memory usage, each seed is encoded as a 64-bit integer hash rather than stored 
+    and compared as a DNA string. This keeps the seed index compact enough to handle up to 10^8 heavy barcodes.
+
+    Hash collisions are possible: two different seeds may produce the same hash. This does not cause incorrect matches 
+    because a hash match only generates a candidate pair. Every candidate is subsequently checked using the actual 
+    barcode distance, which rejects false matches caused by collisions.
+
     Parameters:
-            -- src: str: SQL table/subquery of the children (columns b, n, ...), aliased c
-            -- seed_len: int: bases per seed
-            -- n_seeds: int: number of seed slots (max edits + 1)
-            -- band: int: maximum indels (0 = no indel search)
+        -- src: str: SQL table/subquery of the children (columns b, n, ...), aliased c
+        -- seed_len: int: bases per seed
+        -- n_seeds: int: number of seed slots (max edits + 1)
+        -- band: int: maximum indels (0 = no indel search)
     Returns:
-            -- tuple: (from_clause, seed_hash_expr, shift_filter, length_filter) SQL fragments
+        -- tuple: (from_clause, seed_hash_expr, shift_filter, length_filter) SQL fragments
     """
-    # step1 : with indels (band > 0): probe the child at every shift -band..+band and compare lengths
+    # with indels (band > 0): probe the child at every shift [-band .. +band] and compare lengths
     if band > 0:
         from_clause = ("%s c CROSS JOIN range(%d) AS s(slot) CROSS JOIN range(%d, %d) AS h(sh)"
                        % (src, n_seeds, -band, band + 1))
@@ -81,25 +97,46 @@ def seed_join_parts(src, seed_len, n_seeds, band):
         shift_filter = "AND %s >= 0 AND %s + %d <= length(c.b)" % (pos, pos, seed_len)
         seed_expr = "hash(substr(c.b, %s + 1, %d))" % (pos, seed_len)
         length_filter = "AND abs(length(c.b) - length(p.b)) <= %d" % band
+    # without indels: only the exact slot positions, no shift / length filters
     else:
-    # step2 : without indels: only the exact slot positions, no shift / length filters
         from_clause = "%s c CROSS JOIN range(%d) AS s(slot)" % (src, n_seeds)
         seed_expr = "hash(substr(c.b, s.slot * %d + 1, %d))" % (seed_len, seed_len)
         shift_filter = length_filter = ""
-    # step3 : hand the SQL fragments to the caller
+
     return from_clause, seed_expr, shift_filter, length_filter
 
 
 def rank_key_sql(cost_expr, parent_count_expr, tiebreak_expr):
     """
-    One HUGEINT that orders candidate parents: smaller cost, then larger parent count, then
-    tiebreak_expr (a hash of the parent: deterministic tie break).  Used with arg_min.
+    Build a single HUGEINT ranking key to select the best parent barcode.
+
+    Candidates are ranked using three criteria, in this priority order:
+    1. Edit cost: prefer the parent with fewer mismatches
+    2. Parent read count: if edit costs are equal, prefer parent supported by more sequencing reads.
+    3. Tie-break hash: if both values are equal, prefer parent with the smaller hash
+
+    The three values are packed into separate bit ranges of one integer:
+    [ edit cost: 32 bits | inverted read count: 32 bits | hash: 64 bits ]
+
+    The edit cost occupies the highest bits, so it always takes priority. The read count is inverted 
+    (maximum count - actual count) so that parents with more reads receive smaller ranking values.
+    The hash occupies the lowest bits and is only used when the first two criteria are equal.
+
+    This allows SQL arg_min() to select the best parent using a single
+    integer comparison instead of sorting by three separate columns.    
+
+    R = C * 2^96 + (2^32 - 1 - min(N, 2^32 - 1)) * 2^64 + H
+    R -- Ranking Key
+    C -- edit cost
+    N -- parent read count
+    H -- hash of the parent
+    
     Parameters:
-            -- cost_expr: str: SQL expression, edit cost (smaller is better)
-            -- parent_count_expr: str: SQL expression, reads of the parent (larger is better)
-            -- tiebreak_expr: str: SQL expression returning a UBIGINT hash of the parent
+        -- cost_expr: str: SQL expression, edit cost (smaller is better)
+        -- parent_count_expr: str: SQL expression, reads of the parent (larger is better)
+        -- tiebreak_expr: str: SQL expression returning a UBIGINT hash of the parent
     Returns:
-            -- str: SQL expression
+        -- str: SQL expression
     """
     return ("(%s)::HUGEINT * 79228162514264337593543950336 + "
             "(4294967295 - LEAST(%s, 4294967295))::HUGEINT * 18446744073709551616 + "
@@ -108,31 +145,51 @@ def rank_key_sql(cost_expr, parent_count_expr, tiebreak_expr):
 
 def matched_query_plain(src, seed_len, n_seeds, ratio, max_dist, band):
     """
-    Sequence-only matching (used when barcode quality is off).
-    For every row of `src` (columns b, n) that has a heavy parent: (barcode, n, parent_id) where
-    parent_id is the `hid` of the parent in table `heavy`.  INNER hash joins on integers only
-    (seed hash, then heavy id); everything else is a plain filter, so no nested-loop plan is
-    possible.  Coverage rule: parent n >= ratio x child n (ties broken by sequence).
+    Find the best matching heavy parent barcode for each barcode using sequence
+
+    Matching workflow:
+    1. Generate candidate parents using a pigeonhole seed join. Each child barcode is split into seeds, 
+       and matching seed hashes are used to find potentially similar heavy barcodes.
+    2. Retrieve the candidate parent barcodes from the heavy table using their integer IDs (hid).
+    3. Apply parent eligibility rules:
+        - Parent and child must be different barcodes.
+        - Parent read count must be at least X times the child read count.
+        - If parent and child have equal read counts, the parent must have a lexicographically smaller barcode 
+          than the child. This ensures deterministic direction of matching.
+    4. Calculate the sequence distance between each candidate pair:
+        - Use Hamming distance when band = 0 (substitutions only)
+        - Use Levenshtein distance when band > 0 (indels allowed)
+    5. Discard candidates whose sequence distance exceeds max_dist
+    6. Select the best remaining parent for each child using arg_min, prioritising:
+        - Smallest sequence distance
+        - Largest parent read count
+        - Smallest parent barcode hash as a deterministic tie-breaker
+
+    Candidate generation uses integer seed hashes and integer parent IDs for the joins. Sequence comparisons and 
+    other matching conditions are applied as filters after candidate generation.
+
     Parameters:
-            -- src: str: SQL table/subquery with columns b, n
-            -- seed_len: int: bases per seed
-            -- n_seeds: int: number of seed slots
-            -- ratio: float: parent count must be >= ratio x child count
-            -- max_dist: int: maximum Hamming (or Levenshtein when band > 0) distance
-            -- band: int: maximum indels (0 = Hamming only)
+        -- src: str: SQL table/subquery with columns b, n
+        -- seed_len: int: bases per seed
+         -- n_seeds: int: number of seed slots
+        -- ratio: float: parent count must be >= ratio x child count
+        -- max_dist: int: maximum Hamming (or Levenshtein when band > 0) distance
+        -- band: int: maximum indels (0 = Hamming only)
     Returns:
-            -- str: SQL query returning (barcode, n, parent_id)
+        -- str: SQL query returning (barcode, n, parent_id)
     """
-    # step1 : seed-join fragments
     from_clause, seed, shift_filter, length_filter = seed_join_parts(src, seed_len, n_seeds, band)
-    # step2 : distance: Levenshtein when indels are allowed, else Hamming (99 = different length = rejected)
+    
+    # Levenshtein when indels are allowed, else Hamming (99 = different length = rejected)
     if band > 0:
         dist = "levenshtein(c.b, p.b)"
     else:
         dist = "CASE WHEN length(c.b) = length(p.b) THEN hamming(c.b, p.b) ELSE 99 END"
-    # step3 : ranking key for arg_min: smaller distance, then larger parent count, then hash
+    
+    # ranking key for arg_min: smaller distance, then larger parent count, then hash
     key = rank_key_sql(dist, "p.n", "hash(p.b)")
-    # step4 : assemble: seed join -> heavy lookup -> coverage / tie rules -> distance filter -> best parent
+
+    # assemble: seed join -> heavy lookup -> coverage / tie rules -> distance filter -> best parent
     return ("SELECT c.b AS barcode, c.n AS n, arg_min(p.hid, %s) AS parent_id FROM %s "
             "JOIN hseed q ON q.slot = s.slot AND q.seed_hash = %s "
             "JOIN heavy p ON p.hid = q.hid "
@@ -144,7 +201,7 @@ def matched_query_plain(src, seed_len, n_seeds, ratio, max_dist, band):
 
 def matched_query_quality(src, seed_len, n_seeds, ratio, max_hard, max_low, band):
     """
-    Quality-aware matching.  `src` must have columns b, n, code, conf.
+    Quality-aware matching. src must have columns b, n, code, conf.
     Three nested layers:
       A  seed join -> candidate pairs with total / hard mismatch counts (+ levenshtein if indels)
       B  turn the counts into costs:  ham_cost = hard*COST_SCALE + low  if the pair is within

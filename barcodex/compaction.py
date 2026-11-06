@@ -6,9 +6,15 @@ files  <work>/tuples/t*.parquet.
 import glob
 import os
 import threading
+import time
 import traceback
 
+import duckdb
+
 from .common import dir_gb, log_sub, open_duckdb, sql_list, sql_str
+
+# tries per compaction job before the run stops
+COMPACT_ATTEMPTS = 3
 
 # Column layout of the text parts (must match flush_part).
 PART_COLUMNS = ("{'barcode':'VARCHAR','target':'VARCHAR','cnt':'UBIGINT',"
@@ -39,6 +45,24 @@ def compaction_sql(part_files, parquet_files, out_file):
             "bit_and(tm3) AS tm3, bit_and(bm) AS bm FROM (%s) "
             "GROUP BY barcode, target) TO %s (FORMAT PARQUET, COMPRESSION ZSTD)"
             % (" UNION ALL ".join(sources), sql_str(out_file)))
+
+
+def validation_sql(parquet_file):
+    """
+    SQL returning (rows whose barcode or target has a byte outside printable ASCII, total reads).
+    Sequences from FASTQ are printable ASCII, so any other byte means the file is corrupt.
+    Parameters:
+            -- parquet_file: str: compaction output to check
+    Returns:
+            -- str: SELECT statement returning one row (n_bad, reads)
+    """
+    return ("SELECT COUNT(*) FILTER (WHERE regexp_matches(barcode, '[^\\x21-\\x7e]') "
+            "OR regexp_matches(target, '[^\\x21-\\x7e]')), SUM(cnt) FROM read_parquet(%s)"
+            % sql_str(parquet_file))
+
+
+class CorruptOutput(Exception):
+    """A compaction output failed validation (see Compactor._validate)."""
 
 
 class Compactor:
@@ -116,6 +140,30 @@ class Compactor:
         finally:
             con.close()
 
+    def _validate(self, parquet_files, tmp_out):
+        """
+        Check a freshly written compaction output before its inputs are deleted.
+        Every barcode / target must be printable ASCII (a corrupted string carries bytes like \\x00),
+        and when all inputs are Parquet the read count must be unchanged.
+        Parameters:
+                -- parquet_files: list[str]: Parquet inputs of the job (may be empty)
+                -- tmp_out: str: the written output file
+        Returns:
+                -- None: nothing (raises CorruptOutput when a check fails)
+        """
+        con = open_duckdb(self.work, self.threads, self.mem_gb, "compact")
+        try:
+            n_bad, reads_out = con.execute(validation_sql(tmp_out)).fetchone()
+            if n_bad:
+                raise CorruptOutput("%d row(s) with non-printable bytes in %s" % (n_bad, tmp_out))
+            if parquet_files:
+                reads_in = con.execute("SELECT SUM(cnt) FROM read_parquet(%s)"
+                                       % sql_list(parquet_files)).fetchone()[0]
+                if reads_in != reads_out:
+                    raise CorruptOutput("read count changed: %s in, %s out" % (reads_in, reads_out))
+        finally:
+            con.close()
+
     def _run(self, job):
         """
         Thread body: compact, publish the result atomically, delete the inputs.  Any exception is
@@ -130,8 +178,24 @@ class Compactor:
             level, part_files, parquet_files = job
             self.sequence += 1
             out = "%s/t%d_%06d.parquet" % (self.tuples_dir, level, self.sequence)
-            # step2 : compact into <out>.tmp
-            n_rows = self._compact(part_files, parquet_files, out + ".tmp")
+            # step2 : compact into <out>.tmp, then validate it; retry on a failed read or a corrupt
+            #         output.  Seen in full-size runs (DuckDB 2.0.0, Lustre): transient read errors on
+            #         files that read fine afterwards, and output files with garbage bytes inside a
+            #         string.  The inputs are only deleted after success, so a retry starts from the
+            #         same files
+            for attempt in range(1, COMPACT_ATTEMPTS + 1):
+                try:
+                    n_rows = self._compact(part_files, parquet_files, out + ".tmp")
+                    self._validate(parquet_files, out + ".tmp")
+                    break
+                except (duckdb.Error, CorruptOutput) as e:
+                    if os.path.exists(out + ".tmp"):
+                        os.remove(out + ".tmp")
+                    if attempt == COMPACT_ATTEMPTS:
+                        raise
+                    log_sub("WARNING: compaction attempt %d/%d failed, retrying: %s"
+                            % (attempt, COMPACT_ATTEMPTS, str(e).splitlines()[0][:300]))
+                    time.sleep(30)
             # step3 : publish atomically, then delete the inputs
             os.replace(out + ".tmp", out)
             for f in part_files + parquet_files:

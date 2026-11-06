@@ -13,7 +13,7 @@ import unittest
 
 from helpers import TempDirTestCase, make_args, read_parquet, write_fastq
 from barcodex.common import meta_path
-from barcodex.compaction import Compactor, compaction_sql
+from barcodex.compaction import Compactor, CorruptOutput, compaction_sql
 from barcodex.constants import TARGET_MASK_BITS
 from barcodex.extract import ExtractSpec, SequenceExtractor
 from barcodex.fastq import peek_read_len, reader_proc
@@ -117,6 +117,23 @@ class TestPartsAndCompaction(TempDirTestCase):
         rows = read_parquet(tuples + "/t*.parquet",
                             "SELECT barcode, target, cnt, tm0 FROM t ORDER BY barcode")
         self.assertEqual(rows, [("AAAA", "GGGG", 5, 0b0010), ("CCCC", "TTTT", 1, 0)])
+
+    def test_validate_rejects_corrupt_output(self):
+        """A string with a non-printable byte, or a changed read count, fails validation."""
+        import duckdb
+        con = duckdb.connect()
+        files = {}
+        for name, barcode, cnt in (("in", "ACGT", 5), ("good", "ACGT", 5), ("bad", "AC\x00GT", 5),
+                                   ("lost", "ACGT", 4)):
+            files[name] = os.path.join(self.tmp, name + ".parquet")
+            con.execute("COPY (SELECT ? AS barcode, 'GGNN' AS target, ?::UBIGINT AS cnt) "
+                        "TO '%s' (FORMAT PARQUET)" % files[name], [barcode, cnt])
+        con.close()
+        compactor = Compactor(self.tmp, 1, 1, batch=10, fanout=10)
+        compactor._validate([files["in"]], files["good"])           # passes
+        for name in ("bad", "lost"):
+            with self.assertRaises(CorruptOutput):
+                compactor._validate([files["in"]], files[name])
 
     def test_compaction_sql_inputs(self):
         sql = compaction_sql(["p.tsv.gz"], ["a.parquet"], "out.parquet")

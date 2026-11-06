@@ -1,6 +1,11 @@
 """
-barcodex: out-of-core, quality-aware barcode -> target association for very large paired-end
-data sets.  See README.md for the steps, options and output files.
+barcodex: A tool of association of barcodes and targets for paired-end sequencing data.
+
+1. create barcode and target pairs
+2. cluster barcodes by sequence similarity and base qualities
+3. cluster targets by sequence similarity and base qualities
+4. run a statistical test to find significant barcode-target associations
+5. fast and memory-efficient implementation using DuckDB and SQL queries
 """
 
 __version__ = "0.1"
