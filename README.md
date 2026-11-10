@@ -161,46 +161,40 @@ carried that sequence.
 
 ## Output (tab-separated, one header line)
 
-`<prefix>.barcode_clusters.tsv` has one row per final barcode:
+`<prefix>.barcode_target.details.tsv` has one row per final (barcode, target) pair. Every final
+barcode has exactly one target, so each row describes one barcode, one target and that pair:
 
 | column | meaning |
 |--------|---------|
-| `barcode`, `target` | barcode (centre of its cluster) and its target |
-| `barcode_reads` | reads of the barcode cluster (after clustering) |
-| `n_diff_barcodes` | number of different raw barcodes merged into the cluster (before clustering) |
-| `first_barcode_cov`, `first_barcode_ratio` | reads of the most abundant raw barcode, and its fraction of `barcode_reads` |
+| `barcode`, `target` | barcode (centre of its cluster) and its target (centre of its cluster under this barcode) |
+| `barcode_reads` | reads of the barcode cluster: the sum of the reads of all raw barcodes clustered into this barcode |
+| `n_diff_barcodes` | number of different raw barcodes clustered into this barcode |
+| `first_barcode_cov`, `first_barcode_ratio` | reads of the most abundant raw barcode, and `first_barcode_cov / barcode_reads` |
 | `second_barcode_cov`, `second_barcode_ratio` | the same for the second most abundant raw barcode (0 if none) |
+| `target_reads` | reads of this target under this barcode: the sum of the reads of all raw target sequences clustered into it |
+| `n_diff_targets` | number of different raw target sequences clustered into this target under this barcode |
+| `first_target_cov`, `first_target_ratio` | reads of the most abundant target sequence, and `first_target_cov / target_reads` |
+| `second_target_cov`, `second_target_ratio` | the same for the second most abundant target sequence (0 if none) |
+
+Example: barcode 1 is a cluster of 4 raw barcodes barA, barB, barC, barD with readA >= readB >=
+readC >= readD reads. Then `barcode_reads` = readA + readB + readC + readD, `first_barcode_ratio` =
+readA / `barcode_reads` and `second_barcode_ratio` = readB / `barcode_reads`. A second ratio far
+below the first means barA is the real barcode and the others are sequencing errors or noise.
+The target columns work the same way for the target sequences clustered into the target under
+this barcode.
+
+The rows are sorted by `barcode_reads` (most first). `target_reads` can be smaller than
+`barcode_reads`: reads of the barcode that support other (minor) targets are not counted
+(`reads_minor_targets` in the stats).
 
 Example (combi_6; the 180 bp targets are shortened here with `...`):
 
 ```
-barcode	target	barcode_reads	n_diff_barcodes	first_barcode_cov	first_barcode_ratio	second_barcode_cov	second_barcode_ratio
-ATACATTGTTATTGTGATTAACATTAGGATAGATATTT	GATACACTATGG...GGCACGGGTGAGG	7515	36	7436	0.9895	19	0.0025
-ATAGATTGTTATTTATATGAAAATTGCGATCGGCATAA	GAATGTCACGGT...GCTCACGGATTTTACT	4319	24	4285	0.9921	6	0.0014
-CTTGATTCACATTTTTATGTGAATCTGCATATGGATAT	GAGTAGTCTTCG...GCCGAGGCATAGGGCGTGGG	3793	10	3781	0.9968	2	0.0005
+barcode	target	barcode_reads	n_diff_barcodes	first_barcode_cov	first_barcode_ratio	second_barcode_cov	second_barcode_ratio	target_reads	n_diff_targets	first_target_cov	first_target_ratio	second_target_cov	second_target_ratio
+ATACATTGTTATTGTGATTAACATTAGGATAGATATTT	GATACACTATGG...GGCACGGGTGAGG	7515	36	7436	0.9895	19	0.0025	7392	720	6283	0.85	55	0.0074
+ATAGATTGTTATTTATATGAAAATTGCGATCGGCATAA	GAATGTCACGGT...GCTCACGGATTTTACT	4319	24	4285	0.9921	6	0.0014	4206	442	3511	0.8348	33	0.0078
+CTTGATTCACATTTTTATGTGAATCTGCATATGGATAT	GAGTAGTCTTCG...GCCGAGGCATAGGGCGTGGG	3793	10	3781	0.9968	2	0.0005	3779	257	3310	0.8759	34	0.009
 ```
-
-`<prefix>.target_clusters.tsv` has one row per final (barcode, target) pair:
-
-| column | meaning |
-|--------|---------|
-| `barcode`, `target` | as above |
-| `target_reads` | reads of this barcode that support the target (after target clustering) |
-| `n_diff_targets` | number of different target sequences merged into it (before clustering) |
-| `first_target_cov`, `first_target_ratio` | reads of the most abundant target sequence, and its fraction of `target_reads` |
-| `second_target_cov`, `second_target_ratio` | the same for the second most abundant target sequence |
-
-Example (the same barcodes):
-
-```
-barcode	target	target_reads	n_diff_targets	first_target_cov	first_target_ratio	second_target_cov	second_target_ratio
-ATACATTGTTATTGTGATTAACATTAGGATAGATATTT	GATACACTATGG...GGCACGGGTGAGG	7392	720	6283	0.85	55	0.0074
-ATAGATTGTTATTTATATGAAAATTGCGATCGGCATAA	GAATGTCACGGT...GCTCACGGATTTTACT	4206	442	3511	0.8348	33	0.0078
-CTTGATTCACATTTTTATGTGAATCTGCATATGGATAT	GAGTAGTCTTCG...GCCGAGGCATAGGGCGTGGG	3779	257	3310	0.8759	34	0.009
-```
-
-`target_reads` can be smaller than `barcode_reads`: reads of the barcode that support other
-(minor) targets are not counted (`reads_minor_targets` in the stats).
 
 `<prefix>.stats.tsv` has the columns `step`, `stat`, `value`, `percent` and `description`. The
 rows are ordered by step. Example (combi_6, a few rows of each step):

@@ -14,6 +14,7 @@ import os
 from .common import log, log_sub, meta_path, open_duckdb, sql_str
 from .constants import COST_SCALE, MAX_QUAL_BARCODE_LEN, MIN_SEED_LEN
 
+# ---- SQL methods -------------------------------------------------
 
 def packed_barcode_sql(max_len, fixed_len):
     """
@@ -58,8 +59,10 @@ def packed_barcode_sql(max_len, fixed_len):
         conf_terms.append("(%s)" % conf)
     
     # step2 : OR all lane terms together into two 64-bit words
-    return ("(%s)::UBIGINT" % " | ".join(code_terms),
-            "(%s)::UBIGINT" % " | ".join(conf_terms))
+    return (
+        "(%s)::UBIGINT" % " | ".join(code_terms),
+        "(%s)::UBIGINT" % " | ".join(conf_terms)
+    )
 
 
 def seed_join_parts(src, seed_len, n_seeds, band):
@@ -138,9 +141,11 @@ def rank_key_sql(cost_expr, parent_count_expr, tiebreak_expr):
     Returns:
         -- str: SQL expression
     """
-    return ("(%s)::HUGEINT * 79228162514264337593543950336 + "
-            "(4294967295 - LEAST(%s, 4294967295))::HUGEINT * 18446744073709551616 + "
-            "(%s)::HUGEINT" % (cost_expr, parent_count_expr, tiebreak_expr))
+    return (
+        "(%s)::HUGEINT * 79228162514264337593543950336 + "
+        "(4294967295 - LEAST(%s, 4294967295))::HUGEINT * 18446744073709551616 + "
+        "(%s)::HUGEINT" % (cost_expr, parent_count_expr, tiebreak_expr)
+    )
 
 
 def matched_query_plain(src, seed_len, n_seeds, ratio, max_dist, band):
@@ -190,80 +195,137 @@ def matched_query_plain(src, seed_len, n_seeds, ratio, max_dist, band):
     key = rank_key_sql(dist, "p.n", "hash(p.b)")
 
     # assemble: seed join -> heavy lookup -> coverage / tie rules -> distance filter -> best parent
-    return ("SELECT c.b AS barcode, c.n AS n, arg_min(p.hid, %s) AS parent_id FROM %s "
-            "JOIN hseed q ON q.slot = s.slot AND q.seed_hash = %s "
-            "JOIN heavy p ON p.hid = q.hid "
-            "WHERE p.b <> c.b AND p.n >= %r * c.n "
-            "AND (p.n > c.n OR (p.n = c.n AND p.b < c.b)) %s %s AND (%s) <= %d "
-            "GROUP BY c.b, c.n" % (key, from_clause, seed, float(ratio),
-                                   shift_filter, length_filter, dist, max_dist))
+    return (
+        "SELECT c.b AS barcode, c.n AS n, arg_min(p.hid, %s) AS parent_id FROM %s "
+        "JOIN hseed q ON q.slot = s.slot AND q.seed_hash = %s "
+        "JOIN heavy p ON p.hid = q.hid "
+        "WHERE p.b <> c.b AND p.n >= %r * c.n "
+        "AND (p.n > c.n OR (p.n = c.n AND p.b < c.b)) %s %s AND (%s) <= %d "
+        "GROUP BY c.b, c.n" % (key, from_clause, seed, float(ratio),
+                               shift_filter, length_filter, dist, max_dist)
+    )
 
 
 def matched_query_quality(src, seed_len, n_seeds, ratio, max_hard, max_low, band):
     """
-    Quality-aware matching. src must have columns b, n, code, conf.
-    Three nested layers:
-      A  seed join -> candidate pairs with total / hard mismatch counts (+ levenshtein if indels)
-      B  turn the counts into costs:  ham_cost = hard*COST_SCALE + low  if the pair is within
-         (max_hard, max_low);  lev_cost = lev*COST_SCALE  if lev <= max_hard.  lev_cost is
-         quality-blind and is the only way to match barcodes of unequal length (indel).
-         NULL = not accepted.
-      C  keep accepted pairs, choose the best parent per barcode (arg_min).
+    Build a SQL query for quality-aware barcode matching.
+
+    Each barcode is matched to a more abundant parent barcode, allowing mismatches at low-quality positions 
+    while applying stricter limits to mismatches at high-quality positions.
+
+    The matching procedure has three layers:
+
+    1. Candidate generation:
+       Use seed-based joins to identify potential child-parent pairs. Count the total number of mismatches and 
+       the number occurring at high-quality positions. If indels are allowed, calculate Levenshtein distance.
+    2. Match evaluation:
+       Convert mismatch counts into costs and reject pairs that exceed the allowed mismatch thresholds. High-quality 
+       mismatches receive a bigger penalty than low-quality mismatches. A match is accepted only if both mismatch 
+       limits are satisfied.
+    3. Parent selection:
+       Retain accepted pairs and select the best parent for each barcode using the ranking key.
+
     Parameters:
-            -- src: str: SQL table/subquery with columns b, n, code, conf
-            -- seed_len: int: bases per seed
-            -- n_seeds: int: number of seed slots (max_hard + max_low + 1)
-            -- ratio: float: parent count must be >= ratio x child count
-            -- max_hard: int: maximum mismatches at confident bases (--barcode_dist)
-            -- max_low: int: maximum extra mismatches at low-quality bases
-            -- band: int: maximum indels (0 = none)
+        -- src: str: SQL table/subquery with columns b, n, code, conf
+        -- seed_len: int: bases per seed
+        -- n_seeds: int: number of seed slots (max_hard + max_low + 1)
+        -- ratio: float: parent count must be >= ratio x child count
+        -- max_hard: int: maximum mismatches at confident bases (--barcode_dist)
+        -- max_low: int: maximum extra mismatches at low-quality bases
+        -- band: int: maximum indels (0 = none)
     Returns:
-            -- str: SQL query returning (barcode, n, parent_id)
+        -- str: SQL query returning (barcode, n, parent_id)
     """
-    # step1 : seed-join fragments
+    # Step 1: Generate seed-based candidate child-parent pairs.
+    # Only pairs sharing a compatible seed are considered, avoiding an exhaustive comparison between all barcodes.
     from_clause, seed, shift_filter, length_filter = seed_join_parts(src, seed_len, n_seeds, band)
-    # step2 : hard-mismatch counter on the packed words: ((x | x>>1) & conf_c & conf_p), x = code_c xor code_p
+
+    # Step 2: Define mismatch calculations using packed barcode representations.
+    # The XOR operation identifies nucleotide differences between two barcodes. Each nucleotide is encoded using 2 bits. 
+    # Combining XOR result with its right-shifted copy ensures that either differing bit marks the corresponding nucleotide 
+    # as a mismatch. Intersecting with both confidence masks counts only mismatches where both barcodes have high-quality bases.
     same_len = "length(c.b) = length(p.b)"
     xor_expr = "xor(c.code, p.code)"
-    hard_expr = ("bit_count((((%s) | ((%s) >> 1::UBIGINT)) & c.conf & p.conf)::BIGINT)"
-                 % (xor_expr, xor_expr))
+
+    hard_expr = (
+        "bit_count((((%s) | ((%s) >> 1::UBIGINT)) & c.conf & p.conf)::BIGINT)"
+        % (xor_expr, xor_expr)
+    )
+
     lev_col = ", levenshtein(c.b, p.b) AS lev" if band > 0 else ""
-    # step3 : layer A: seed join -> candidate pairs with total / hard mismatch counts
-    layer_a = ("SELECT c.b AS barcode, c.n AS n, p.hid AS parent_id, p.n AS parent_n, "
-               "hash(p.b) AS parent_hash, "
-               "CASE WHEN %s THEN hamming(c.b, p.b) END AS total, "
-               "CASE WHEN %s THEN %s END AS hard%s "
-               "FROM %s JOIN hseed q ON q.slot = s.slot AND q.seed_hash = %s "
-               "JOIN heavy p ON p.hid = q.hid "
-               "WHERE p.b <> c.b AND p.n >= %r * c.n "
-               "AND (p.n > c.n OR (p.n = c.n AND p.b < c.b)) %s %s"
-               % (same_len, same_len, hard_expr, lev_col, from_clause, seed,
-                  float(ratio), shift_filter, length_filter))
-    # step4 : layer B: costs  (Hamming cost obeys max_hard / max_low; Levenshtein cost is quality-blind)
-    ham_cost = ("CASE WHEN total IS NOT NULL AND hard <= %d AND total - hard <= %d "
-                "THEN hard * %d + (total - hard) END" % (max_hard, max_low, COST_SCALE))
-    lev_cost = ("CASE WHEN lev <= %d THEN lev * %d END" % (max_hard, COST_SCALE)
-                if band > 0 else "NULL")
-    layer_b = ("SELECT barcode, n, parent_id, parent_n, parent_hash, "
-               "%s AS ham_cost, %s AS lev_cost FROM (%s)"
-               % (ham_cost, lev_cost, layer_a))
-    # step5 : layer C: keep accepted pairs, best parent per barcode (arg_min over the rank key)
+
+    # Step 3: Build candidate pairs and calculate their mismatch statistics.
+    # Each candidate must:
+    #   - Have a different barcode sequence from the child.
+    #   - Meet the minimum parent-to-child read-count ratio.
+    #   - Follow the abundance-based ordering used to avoid duplicate child-parent comparisons.
+    layer_a = (
+        "SELECT c.b AS barcode, c.n AS n, p.hid AS parent_id, p.n AS parent_n, "
+        "hash(p.b) AS parent_hash, "
+        "CASE WHEN %s THEN hamming(c.b, p.b) END AS total, "
+        "CASE WHEN %s THEN %s END AS hard%s "
+        "FROM %s JOIN hseed q ON q.slot = s.slot AND q.seed_hash = %s "
+        "JOIN heavy p ON p.hid = q.hid "
+        "WHERE p.b <> c.b AND p.n >= %r * c.n "
+        "AND (p.n > c.n OR (p.n = c.n AND p.b < c.b)) %s %s"
+        % (
+            same_len, same_len, hard_expr, lev_col,
+            from_clause, seed, float(ratio),
+            shift_filter, length_filter
+        )
+    )
+
+    # Step 4: Evaluate candidate pairs using two independent matching criteria.
+    # Hamming cost:
+    #   Accept only if both the high-quality mismatch count and the low-quality mismatch count are within limits.
+    #   low-quality mismatches = total mismatches - high-quality mismatches
+    # Levenshtein cost:
+    #   Accept pairs whose edit distance is within max_hard.
+    ham_cost = (
+        "CASE WHEN total IS NOT NULL AND hard <= %d AND total - hard <= %d "
+        "THEN hard * %d + (total - hard) END"
+        % (max_hard, max_low, COST_SCALE)
+    )
+
+    lev_cost = (
+        "CASE WHEN lev <= %d THEN lev * %d END" % (max_hard, COST_SCALE)
+        if band > 0 else "NULL"
+    )
+
+    layer_b = (
+        "SELECT barcode, n, parent_id, parent_n, parent_hash, "
+        "%s AS ham_cost, %s AS lev_cost FROM (%s)"
+        % (ham_cost, lev_cost, layer_a)
+    )
+
+    # Step 5: Select the best accepted parent for each child barcode.
+    # A candidate is accepted if it passes either the Hamming or Levenshtein matching criterion.
+    #
+    # When both costs are available, use the lower cost. COALESCE assigns a large penalty to a criterion 
+    # that did not accept the candidate.
+    #
+    # rank_key_sql adds parent abundance and a deterministic tie-breaker to the matching cost. 
+    # arg_min then selects the parent with the best overall ranking for each barcode.
     best_cost = "LEAST(COALESCE(ham_cost, 2147483647), COALESCE(lev_cost, 2147483647))"
+
     key = rank_key_sql(best_cost, "parent_n", "parent_hash")
-    return ("SELECT barcode, n, arg_min(parent_id, %s) AS parent_id FROM (%s) "
-            "WHERE ham_cost IS NOT NULL OR lev_cost IS NOT NULL GROUP BY barcode, n"
-            % (key, layer_b))
+
+    return (
+        "SELECT barcode, n, arg_min(parent_id, %s) AS parent_id FROM (%s) "
+        "WHERE ham_cost IS NOT NULL OR lev_cost IS NOT NULL GROUP BY barcode, n"
+        % (key, layer_b)
+    )
 
 
 # ---- DuckDB utilities -------------------------------------------------
 
 def spill_gb(work):
     """
-    Size of the DuckDB spill directory of S2 (disk used because RAM was too small).
+    Size of the DuckDB spill directory of S2 (disk used to reduce memory usage).
     Parameters:
-            -- work: str: work directory (spill directory is <work>/duck_bc)
+        -- work: str: work directory (spill directory is <work>/duck_bc)
     Returns:
-            -- float: size in GB
+        -- float: size in GB
     """
     total = 0
     for d, _, files in os.walk(os.path.join(work, "duck_bc")):
@@ -278,22 +340,17 @@ def spill_gb(work):
 def pin_join_order(con, enabled):
     """
     Execute the joins in the order they are written (enabled=True) or let DuckDB choose.
-    The matching queries are written as  children JOIN seed-index(ints) JOIN heavy(strings).  If
-    the optimizer joined the two small tables first, the join table would again carry the 150-bp
-    strings of every heavy barcode (the memory problem of the old version).  Failing to set this
-    is harmless (only a note is printed).
+
     Parameters:
-            -- con: duckdb connection
-            -- enabled: bool: True = pin the join order, False = reset to the optimizer default
+        -- con: duckdb connection
+        -- enabled: bool: True = pin the join order, False = reset to the optimizer default
     Returns:
-            -- None: nothing
+        -- None: nothing
     """
     try:
-        con.execute("SET disabled_optimizers='join_order'" if enabled
-                    else "RESET disabled_optimizers")
+        con.execute("SET disabled_optimizers='join_order'" if enabled else "RESET disabled_optimizers")
     except Exception as e:
-        log_sub("NOTE: could not %s join-order pinning (%s)"
-                % ("enable" if enabled else "reset", str(e).splitlines()[0]))
+        log_sub("NOTE: could not %s join-order pinning (%s)" % ("enable" if enabled else "reset", str(e).splitlines()[0]))
 
 
 def dump_plan(con, query, path):

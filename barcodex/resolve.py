@@ -7,9 +7,8 @@ Inputs  (intermediate files in <out>.meta/, written by S1 / S2 / S4):
   raw_stats.json             raw barcode / target counts, reads kept by the barcode clustering
   ingest_stats.json          read pairs parsed / rejected by the extraction
 Outputs:
-  <out>.barcode_clusters.tsv   one row per final barcode
-  <out>.target_clusters.tsv    one row per final (barcode, target) pair
-  <out>.stats.tsv              summary numbers (see stats.py)
+  <out>.barcode_target.details.tsv   one row per final (barcode, target) pair
+  <out>.stats.tsv                    summary numbers (see stats.py)
 --resolve_only re-runs this stage from <out>.meta/.
 
 Memory: the tables hold no sequences.  Barcodes and targets are keyed by md5_number() (128 bit,
@@ -234,26 +233,33 @@ def final_rows_sql(src, merged):
             % pairs_csv(src))
 
 
-def write_cluster_files(con, args, src, merged):
+def write_details_file(con, args, src, merged):
     """
-    Write <out>.barcode_clusters.tsv and <out>.target_clusters.tsv for the final pairs.
+    Write <out>.barcode_target.details.tsv: one row per final (barcode, target) pair.
+    Every final barcode has exactly one target, so the barcode-cluster statistics belong to the
+    pair as well.
     Parameters:
             -- con: duckdb connection with table final (and tstr if merged)
             -- args: argparse.Namespace: out
             -- src: str: path of target_pairs.tsv
             -- merged: bool: True = --merge_dist > 0
     Returns:
-            -- None: nothing; writes the files
+            -- None: nothing; writes the file
     """
-    rows = final_rows_sql(src, merged)
-    tsv = "(DELIMITER '\t', HEADER)"
-
-    # step1 : barcode clustering file: one row per final barcode
-    #   barcode_reads    = reads of the barcode cluster (coverage after clustering)
-    #   n_diff_barcodes  = number of different raw barcodes merged into it (before clustering)
-    #   first_/second_barcode_cov = reads of the most / second most abundant raw barcode,
-    #   first_/second_barcode_ratio = cov / barcode_reads
-    log_sub("writing %s" % (args.out + ".barcode_clusters.tsv"))
+    # step1 : columns of the pair
+    #   barcode side (S2): the barcode cluster of the pair
+    #     barcode_reads               = reads of all raw barcodes clustered into this barcode
+    #     n_diff_barcodes             = raw barcodes clustered into this barcode
+    #     first_/second_barcode_cov   = reads of the most / second most abundant raw barcode
+    #     first_/second_barcode_ratio = cov / barcode_reads
+    #   target side (S4, and S5 with --merge_dist): the target cluster under this barcode
+    #     target_reads                = reads of all raw target sequences clustered into this target
+    #                                   under this barcode
+    #     n_diff_targets              = raw target sequences clustered into this target under this barcode
+    #     first_/second_target_cov    = reads of the most / second most abundant target sequence
+    #     first_/second_target_ratio  = cov / target_reads
+    out = args.out + ".barcode_target.details.tsv"
+    log_sub("writing %s" % out)
     con.execute("""
         COPY (SELECT barcode, target,
                      bc_count AS barcode_reads,
@@ -261,19 +267,7 @@ def write_cluster_files(con, args, src, merged):
                      bc_first_cov AS first_barcode_cov,
                      round(bc_first_cov * 1.0 / bc_count, 4) AS first_barcode_ratio,
                      bc_second_cov AS second_barcode_cov,
-                     round(bc_second_cov * 1.0 / bc_count, 4) AS second_barcode_ratio
-              FROM (%s)
-              ORDER BY bc_count DESC, barcode)
-        TO %s %s""" % (rows, sql_str(args.out + ".barcode_clusters.tsv"), tsv))
-
-    # step2 : target clustering file: one row per final (barcode, target) pair
-    #   target_reads    = reads of the pair after target clustering
-    #   n_diff_targets  = number of different target sequences merged into it (before clustering)
-    #   first_/second_target_cov = reads of the most / second most abundant target sequence,
-    #   first_/second_target_ratio = cov / target_reads
-    log_sub("writing %s" % (args.out + ".target_clusters.tsv"))
-    con.execute("""
-        COPY (SELECT barcode, target,
+                     round(bc_second_cov * 1.0 / bc_count, 4) AS second_barcode_ratio,
                      pair_reads AS target_reads,
                      n_variants AS n_diff_targets,
                      first_cov AS first_target_cov,
@@ -281,15 +275,15 @@ def write_cluster_files(con, args, src, merged):
                      second_cov AS second_target_cov,
                      round(second_cov * 1.0 / pair_reads, 4) AS second_target_ratio
               FROM (%s)
-              ORDER BY pair_reads DESC, barcode)
-        TO %s %s""" % (rows, sql_str(args.out + ".target_clusters.tsv"), tsv))
+              ORDER BY bc_count DESC, pair_reads DESC, barcode)
+        TO %s (DELIMITER '\t', HEADER)""" % (final_rows_sql(src, merged), sql_str(out)))
 
 
 # ---- stage driver ----------------------------------------------------------
 
 def resolve_pairs(args, threads):
     """
-    S5: decide ONE target per barcode and write the three result files.
+    S5: decide ONE target per barcode and write the two result files.
     A barcode is final when its best target has >= --min_pair_reads reads and >= --min_purity of
     the barcode's reads (status 'unique' or 'resolved').
     Parameters:
@@ -359,7 +353,7 @@ def resolve_pairs(args, threads):
         con.execute("DROP TABLE IF EXISTS %s" % table)
 
     # step6 : result files
-    write_cluster_files(con, args, src, merged)
+    write_details_file(con, args, src, merged)
     log_sub("writing %s" % (args.out + ".stats.tsv"))
     write_stats(args.out + ".stats.tsv", stats)
 

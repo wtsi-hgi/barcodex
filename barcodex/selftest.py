@@ -138,7 +138,7 @@ def run_scenario(scenario, seed=7):
             "--compact_parts", "2", "--merge_files", "2", "--shards", "4"])
     # step3 : compare the output with the truth
     got = {}
-    with open(out + ".barcode_clusters.tsv") as fh:
+    with open(out + ".barcode_target.details.tsv") as fh:
         next(fh)
         for line in fh:
             fields = line.rstrip("\n").split("\t")
