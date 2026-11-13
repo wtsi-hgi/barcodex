@@ -41,12 +41,13 @@ def write_meta(args, with_ingest_stats=True):
                 % (values, meta_path(args, "barcode_clusters.parquet")))
     con.close()
     with open(meta_path(args, "raw_stats.json"), "w") as fo:
-        json.dump({"raw_barcodes": 9, "raw_targets": 5, "reads_in": 44, "reads_clustered": 41},
-                  fo)
+        json.dump({"raw_barcodes": 9, "raw_targets": 5, "raw_barcode_target_pairs": 12,
+                   "reads_in": 44, "reads_clustered": 41}, fo)
     if with_ingest_stats:
         with open(meta_path(args, "ingest_stats.json"), "w") as fo:
             json.dump({"total_read_pairs": 50, "extracted_read_pairs": 44,
-                       "rejects": [["barcode_upstream_not_found", 6, "no flank"]]}, fo)
+                       "rejects": [["barcode_upstream_not_found", 6, "no flank"],
+                                   ["target_empty", 0, "empty target"]]}, fo)
 
 
 class TestResolve(TempDirTestCase):
@@ -119,32 +120,47 @@ class TestResolve(TempDirTestCase):
 
     def test_stats_by_step_and_read_funnel(self):
         _, rows = self.run_resolve()
-        self.assertEqual(list(rows[0]), ["step", "stat", "value", "percent", "description"])
+        self.assertEqual(list(rows[0]), ["step", "stat", "count", "percent", "description"])
         steps = [r["step"] for r in rows]
         self.assertEqual(steps, sorted(steps))                      # ordered by step
-        stats = {r["stat"]: (r["value"], r["percent"]) for r in rows}
-        expected = {"total_read_pairs": ("50", "100.00"),
-                    "barcode_upstream_not_found": ("6", "12.00"),
-                    "extracted_read_pairs": ("44", "88.00"),
+        stats = {r["stat"]: (r["count"], r["percent"]) for r in rows}
+        # target reject rows come before barcode reject rows
+        names = [r["stat"] for r in rows]
+        self.assertLess(names.index("reads_target_missing"),
+                        names.index("reads_barcode_upstream_not_found"))
+        expected = {"reads_raw_input": ("50", "100.00"),
+                    "reads_target_missing": ("0", "0.00"),
+                    "reads_barcode_upstream_not_found": ("6", "12.00"),
+                    "num_raw_barcodes": ("9", "NA"), "num_raw_targets": ("5", "NA"),
+                    "num_raw_barcode_target_pairs": ("12", "NA"),
                     "reads_dropped_barcode_clustering": ("3", "6.00"),
-                    "reads_low_coverage_barcodes": ("1", "2.00"),
-                    "reads_ambiguous_barcodes": ("10", "20.00"),
-                    "reads_minor_targets": ("2", "4.00"),
-                    "effective_reads": ("28", "56.00"),
-                    "barcode_clusters": ("4", "NA"), "barcodes_unique": ("1", "NA"),
-                    "barcodes_multi_target": ("2", "NA"), "barcodes_resolved": ("1", "NA"),
-                    "barcodes_ambiguous": ("1", "NA"), "barcodes_low_coverage": ("1", "NA"),
-                    "barcode_target_variants": ("6", "NA"),
-                    "barcode_target_clusters": ("6", "NA"),
-                    "final_barcodes": ("2", "NA"), "final_targets": ("1", "NA"),
+                    "reads_in_barcode_clustering": ("41", "82.00"),
+                    "num_barcodes_after_clustering": ("4", "NA"),
+                    "reads_dropped_target_clustering": ("0", "0.00"),
+                    "reads_in_target_clustering": ("41", "82.00"),
+                    "num_target_after_clustering": ("3", "NA"),
+                    "reads_barcodes_multi_targets": ("30", "60.00"),
+                    "num_barcodes_multi_targets": ("2", "NA"),
+                    "reads_barcodes_resolved": ("20", "40.00"),
+                    "num_barcodes_resolved": ("1", "NA"),
+                    "reads_barcodes_ambiguous": ("10", "20.00"),
+                    "num_barcodes_ambiguous": ("1", "NA"),
+                    "reads_barcodes_low_coverage": ("1", "2.00"),
+                    "num_barcodes_low_coverage": ("1", "NA"),
+                    "num_final_barcodes": ("2", "NA"), "num_final_targets": ("1", "NA"),
+                    "num_final_barcode_target_pairs": ("2", "NA"),
+                    "reads_final_effective": ("28", "56.00"),
                     "mean_barcodes_per_target": ("2", "NA")}
         self.assertEqual({k: stats[k] for k in expected}, expected)
+        for old_name in ("total_read_pairs", "extracted_read_pairs", "effective_reads",
+                         "barcodes_unique", "reads_minor_targets"):
+            self.assertNotIn(old_name, stats)
 
     def test_older_meta_without_ingest_stats(self):
         _, rows = self.run_resolve(with_ingest_stats=False)
-        stats = {r["stat"]: (r["value"], r["percent"]) for r in rows}
-        self.assertNotIn("total_read_pairs", stats)
-        self.assertEqual(stats["effective_reads"], ("28", "NA"))
+        stats = {r["stat"]: (r["count"], r["percent"]) for r in rows}
+        self.assertNotIn("reads_raw_input", stats)
+        self.assertEqual(stats["reads_final_effective"], ("28", "NA"))
 
     def test_number_format(self):
         self.assertEqual((number(None), number(3.0), number(2.345)), ("0", "3", "2.35"))

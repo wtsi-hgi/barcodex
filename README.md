@@ -196,43 +196,53 @@ ATAGATTGTTATTTATATGAAAATTGCGATCGGCATAA	GAATGTCACGGT...GCTCACGGATTTTACT	4319	24	4
 CTTGATTCACATTTTTATGTGAATCTGCATATGGATAT	GAGTAGTCTTCG...GCCGAGGCATAGGGCGTGGG	3793	10	3781	0.9968	2	0.0005	3779	257	3310	0.8759	34	0.009
 ```
 
-`<prefix>.stats.tsv` has the columns `step`, `stat`, `value`, `percent` and `description`. The
-rows are ordered by step. Example (combi_6, a few rows of each step):
+`<prefix>.stats.tsv` has the columns `step`, `stat`, `count`, `percent` and `description`. The
+rows are ordered by step. Stat names start with `reads_` (read-pair counts), `num_` (numbers of
+sequences / barcodes / targets) or `mean_` / `median_`. Example (a few rows of each step):
 
 ```
-step	stat	value	percent	description
-1_input	total_read_pairs	93586470	100.00	read pairs in the FASTQ files
-2_extraction	target_upstream_not_found	7871550	8.41	read pairs rejected: upstream flank (--target_up) not found
-2_extraction	barcode_template_mismatch	3820687	4.08	read pairs rejected: barcode does not match --barcode_temp NNNNATNNNNATNNNNATNNNNATNNNNATNNNNATNN
-2_extraction	extracted_read_pairs	73213797	78.23	read pairs with a valid barcode and target
-3_barcode_clustering	raw_barcodes	3810506	NA	distinct barcode sequences before clustering
-3_barcode_clustering	barcode_clusters	2581093	NA	barcode clusters with reads after clustering
-4_target_clustering	barcode_target_clusters	5024288	NA	(barcode cluster, target cluster) pairs after target clustering
-5_target_assignment	barcodes_ambiguous	36448	NA	top target has < 0.8 of the barcode's reads (--min_purity): dropped
-6_final_map	final_barcodes	2534431	NA	barcodes in the final barcode -> target map
-6_final_map	effective_reads	69896857	74.69	reads supporting the final (barcode, target) pairs
-6_final_map	barcode_coverage_median	23	NA	median reads per final barcode (after clustering)
+step	stat	count	percent	description
+1_input	reads_raw_input	93586470	100.00	read pairs in the FASTQ files
+2_extraction	reads_target_upstream_not_found	7871550	8.41	read pairs rejected: upstream flank (--target_up) not found
+2_extraction	reads_barcode_incorrect_template	3820737	4.08	read pairs rejected: barcode does not match --barcode_temp NNNNATNNNNATNNNNATNNNNATNNNNATNNNNATNN
+2_extraction	num_raw_barcodes	3810485	NA	distinct barcode sequences extracted (before barcode clustering)
+3_barcode_clustering	num_barcodes_after_clustering	2581082	NA	barcodes (barcode clusters) after clustering
+5_target_assignment	num_barcodes_ambiguous	36442	NA	multi-target barcodes NOT resolved: their top target has >= 3 reads (--min_pair_reads) but < 0.8 of the barcode's reads (--min_purity), no dominant target; dropped
+6_final_map	reads_final_effective	69897106	74.69	reads supporting the final (barcode, target) pairs
+6_final_map	median_barcode_coverage	23	NA	median reads per final barcode (after clustering)
 ```
 
 All rows:
 
 | step | stats |
 |------|-------|
-| `1_input` | `total_read_pairs` |
-| `2_extraction` | one row per reject reason, then `extracted_read_pairs` |
-| `3_barcode_clustering` | `raw_barcodes`, `barcode_clusters`, `reads_dropped_barcode_clustering`, `reads_in_barcode_clusters` |
-| `4_target_clustering` | `raw_targets`, `barcode_target_variants` (before) and `barcode_target_clusters` (after) |
-| `5_target_assignment` | `barcodes_unique` / `_multi_target` / `_resolved` / `_ambiguous` / `_low_coverage`, and the reads not used: `reads_low_coverage_barcodes`, `reads_ambiguous_barcodes`, `reads_minor_targets` |
-| `6_final_map` | final barcodes, targets and pairs, `effective_reads`, mean/median coverage, `mean_barcodes_per_target` |
+| `1_input` | `reads_raw_input` |
+| `2_extraction` | one `reads_<target\|barcode>_<reason>` row per reject reason (target rows first), then `num_raw_barcodes`, `num_raw_targets`, `num_raw_barcode_target_pairs` |
+| `3_barcode_clustering` | `reads_dropped_barcode_clustering`, `reads_in_barcode_clustering`, `num_barcodes_after_clustering` |
+| `4_target_clustering` | `reads_dropped_target_clustering`, `reads_in_target_clustering`, `num_target_after_clustering` |
+| `5_target_assignment` | `reads_` / `num_barcodes_multi_targets`, `reads_` / `num_barcodes_resolved`, `reads_` / `num_barcodes_ambiguous`, `reads_` / `num_barcodes_low_coverage` |
+| `6_final_map` | `num_final_barcodes`, `num_final_targets`, `num_final_barcode_target_pairs`, `reads_final_effective`, `mean_` / `median_barcode_coverage`, `mean_` / `median_target_coverage`, `mean_barcodes_per_target` |
 
-* `percent` is filled for read counts (`value / total_read_pairs x 100`) and is `NA` otherwise.
+* `percent` is filled for `reads_*` rows (`count / reads_raw_input x 100`) and is `NA` otherwise.
+* Barcode status in `5_target_assignment`:
+  * resolved: multi-target barcode whose top target has >= `--min_pair_reads` reads and >=
+    `--min_purity` of the barcode's reads; kept with that target.
+  * ambiguous: multi-target barcode whose top target has enough reads but < `--min_purity` of
+    the barcode's reads (no dominant target); dropped.
+  * low coverage: any barcode (single- or multi-target) whose top target has <
+    `--min_pair_reads` reads; dropped.
+  * `num_final_barcodes` = single-target barcodes that pass `--min_pair_reads` + resolved barcodes.
 * The read counts add up:
-  * `total_read_pairs` = the reject rows of `2_extraction` + `extracted_read_pairs`
-  * `extracted_read_pairs` = `reads_dropped_barcode_clustering` + `reads_low_coverage_barcodes`
-    \+ `reads_ambiguous_barcodes` + `reads_minor_targets` + `effective_reads`
+  * `reads_raw_input` = the reject rows of `2_extraction` + `reads_dropped_barcode_clustering`
+    \+ `reads_in_barcode_clustering`
+  * `reads_in_barcode_clustering` = `reads_dropped_target_clustering` + `reads_in_target_clustering`
+  * `reads_in_target_clustering` = `reads_barcodes_low_coverage` + `reads_barcodes_ambiguous`
+    \+ `reads_final_effective` + the reads of resolved barcodes that support a minor target
 * Reject rows appear only for the reasons that the chosen settings can produce:
-  `*_upstream_not_found`, `*_downstream_not_found`, `barcode_too_short`, `*_empty`,
-  `target_too_long`, `*_below_min_len`, `*_length_filtered` and `barcode_template_mismatch`.
+  `*_upstream_not_found`, `*_downstream_not_found`, `*_missing` (empty sequence),
+  `barcode_read_too_short` (pos method), `target_too_long` (> 255 bp),
+  `*_incorrect_length` (`--*_min_len`), `*_length_not_allowed` (`--*_allowed_lens`) and
+  `*_incorrect_template` (`--barcode_temp`).
 * Each rejected pair is counted once, under the first reason that applies. The checks run in the
   same order as in the `associate_*.py` scripts: target extraction, barcode extraction, target
   filters, barcode filters.

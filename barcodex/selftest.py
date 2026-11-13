@@ -12,9 +12,10 @@ from .common import log
 SELFTEST_UP = "GTCCTCTTCCCATCT"
 SELFTEST_DOWN = "TGGTGGAAGCTACTG"
 
-# read-funnel rows of the stats file that must add up to total_read_pairs
-FUNNEL_AFTER_EXTRACTION = ("reads_dropped_barcode_clustering", "reads_low_coverage_barcodes",
-                           "reads_ambiguous_barcodes", "reads_minor_targets", "effective_reads")
+# read-funnel rows of the stats file (see stats.py: the read counts add up)
+# reads_in_target_clustering - these = reads of kept barcodes that support a minor target
+FUNNEL_AFTER_TARGET_CLUSTERING = ("reads_barcodes_low_coverage", "reads_barcodes_ambiguous",
+                                  "reads_final_effective")
 
 
 def write_synthetic_fastq(tmp_dir, scenario, rnd, n_barcodes=300, barcode_len=16, target_len=60,
@@ -100,7 +101,7 @@ def read_stats(path):
     Parameters:
             -- path: str: <out>.stats.tsv
     Returns:
-            -- dict: stat -> value (str)
+            -- dict: stat -> count (str)
     """
     with open(path) as fh:
         next(fh)
@@ -152,12 +153,16 @@ def run_scenario(scenario, seed=7):
     stats = read_stats(out + ".stats.tsv")
     with open(out + ".meta/ingest_stats.json") as fh:
         rejected = sum(row[1] for row in json.load(fh)["rejects"])
-    funnel_ok = (int(stats["total_read_pairs"]) == rejected + int(stats["extracted_read_pairs"])
-                 and int(stats["extracted_read_pairs"])
-                 == sum(int(stats[k]) for k in FUNNEL_AFTER_EXTRACTION))
+    n = {k: int(v) for k, v in stats.items() if k.startswith("reads_")}
+    minor = n["reads_in_target_clustering"] - sum(n[k] for k in FUNNEL_AFTER_TARGET_CLUSTERING)
+    funnel_ok = (n["reads_raw_input"] == rejected + n["reads_dropped_barcode_clustering"]
+                 + n["reads_in_barcode_clustering"]
+                 and n["reads_in_barcode_clustering"]
+                 == n["reads_dropped_target_clustering"] + n["reads_in_target_clustering"]
+                 and 0 <= minor <= n["reads_barcodes_resolved"])
     if scenario == "flank":
         # a random replacement flank can still match within 2 mismatches, hence <=
-        funnel_ok = funnel_ok and int(stats["barcode_upstream_not_found"]) <= n_no_flank
+        funnel_ok = funnel_ok and int(stats["reads_barcode_upstream_not_found"]) <= n_no_flank
     log("SELFTEST %s: read funnel %s" % (scenario, "adds up" if funnel_ok else "does NOT add up"))
     # step5 : PASS rule
     passed = (n_ok >= 0.97 * len(truth) and n_wrong == 0 and n_extra <= 0.02 * len(truth)

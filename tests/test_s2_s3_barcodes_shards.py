@@ -48,6 +48,19 @@ class TestStageBarcodes(TempDirTestCase):
             raw = json.load(fh)
         self.assertEqual((raw["raw_barcodes"], raw["reads_in"], raw["reads_clustered"]),
                          (4, 33, 32))
+        self.assertEqual((raw["raw_targets"], raw["raw_barcode_target_pairs"]), (3, 4))
+
+    def test_raw_pairs_counted_once_across_tuple_files(self):
+        """The same (barcode, target) pair in two tuple files (tiers) is one raw pair."""
+        work = os.path.join(self.tmp, "work")
+        os.makedirs(work + "/tuples")
+        write_tuples(work + "/tuples/t1_000001.parquet", [(HEAVY, "TGT1", 20), (OTHER, "TGT2", 10)])
+        write_tuples(work + "/tuples/t1_000002.parquet", [(HEAVY, "TGT1", 5), (HEAVY, "TGT2", 1)])
+        args = make_args(os.path.join(self.tmp, "out"))
+        stage_barcodes(args, work, 1, 1.0)
+        with open(meta_path(args, "raw_stats.json")) as fh:
+            raw = json.load(fh)
+        self.assertEqual(raw["raw_barcode_target_pairs"], 3)
 
 
 class TestStageShards(TempDirTestCase):

@@ -8,6 +8,7 @@ Clustering barcodes by sequence similarity and abundance, then mapping every bar
 SQL builders: packed barcodes, seed join, ranking, matching queries
 """
 
+import glob
 import json
 import os
 
@@ -416,6 +417,17 @@ def stage_barcodes(args, work, threads, mem_gb):
     n_raw_targets = con.execute("SELECT COUNT(*) FROM (SELECT target FROM %s GROUP BY target)"
                                 % tuples).fetchone()[0]
     log_sub("%d distinct raw target sequences" % n_raw_targets)
+    #      |----   substep distinct raw (barcode, target) pairs (for the stats file)
+    #      |----   substep one compacted file holds unique (barcode, target) rows: its row count is the answer;
+    #      |----   substep several tiers can repeat a pair, so count distinct 128-bit md5 keys of the pair
+    tuple_files = glob.glob(work + "/tuples/t*.parquet")
+    if len(tuple_files) == 1:
+        n_raw_pairs = con.execute("SELECT COUNT(*) FROM %s" % tuples).fetchone()[0]
+    else:
+        n_raw_pairs = con.execute(
+            "SELECT COUNT(*) FROM (SELECT md5_number(barcode || '|' || target) AS k FROM %s "
+            "GROUP BY k)" % tuples).fetchone()[0]
+    log_sub("%d distinct raw (barcode, target) pairs" % n_raw_pairs)
 
     # step3 : settings: ratio, distances, quality mode and seed layout
     ratio = max(args.barcode_ratio, 1.0)        # parent count >= ratio x child count
@@ -580,6 +592,7 @@ def stage_barcodes(args, work, threads, mem_gb):
     os.makedirs(meta_path(args), exist_ok=True)
     with open(meta_path(args, "raw_stats.json"), "w") as fo:
         json.dump({"raw_barcodes": n_distinct, "raw_targets": n_raw_targets,
+                   "raw_barcode_target_pairs": n_raw_pairs,
                    "reads_in": n_reads, "reads_clustered": n_mapped_reads or 0}, fo)
 
     # step8 : per barcode-cluster statistics (used for the final barcode file)
