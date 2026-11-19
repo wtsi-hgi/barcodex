@@ -71,7 +71,9 @@ def number(x):
     Returns:
             -- str: formatted number
     """
-    return "0" if x is None else ("%d" % x if float(x).is_integer() else "%.2f" % x)
+    if x is None:
+        return "0"
+    return f"{int(x)}" if float(x).is_integer() else f"{x:.2f}"
 
 
 def reject_stat_name(key):
@@ -83,7 +85,7 @@ def reject_stat_name(key):
             -- str: 'reads_<role>_<name>' (unknown reasons keep their own name)
     """
     role, _, reason = key.partition("_")
-    return "reads_%s_%s" % (role, REJECT_NAMES.get(reason, reason))
+    return f"reads_{role}_{REJECT_NAMES.get(reason, reason)}"
 
 
 # ---- one function per step -------------------------------------------------
@@ -192,18 +194,18 @@ def assignment_stats(con, args):
     step = "5_target_assignment"
     mp, pur, mpr = args.min_pair_reads, args.min_purity, args.min_purity_reads
     if mpr > 1:
-        of = ("the barcode's reads, not counting its other targets with < %d reads "
-              "(--min_purity_reads)" % mpr)
+        of = (f"the barcode's reads, not counting its other targets with < {mpr} reads "
+              "(--min_purity_reads)")
     else:
         of = "the barcode's reads"
-    resolved = ("multi-target barcodes resolved to ONE target: their top target has >= %d reads "
-                "(--min_pair_reads) and >= %g of %s (--min_purity); kept with "
-                "that target" % (mp, pur, of))
-    ambiguous = ("multi-target barcodes NOT resolved: their top target has >= %d reads "
-                 "(--min_pair_reads) but < %g of %s (--min_purity), no "
-                 "dominant target; dropped" % (mp, pur, of))
-    low = ("barcodes (single- or multi-target) whose top target has < %d reads "
-           "(--min_pair_reads); dropped" % mp)
+    resolved = (f"multi-target barcodes resolved to ONE target: their top target has >= {mp} reads "
+                f"(--min_pair_reads) and >= {pur:g} of {of} (--min_purity); kept with "
+                "that target")
+    ambiguous = (f"multi-target barcodes NOT resolved: their top target has >= {mp} reads "
+                 f"(--min_pair_reads) but < {pur:g} of {of} (--min_purity), no "
+                 "dominant target; dropped")
+    low = (f"barcodes (single- or multi-target) whose top target has < {mp} reads "
+           "(--min_pair_reads); dropped")
     return [
         Stat(step, "reads_barcodes_multi_targets", reads_multi,
              "reads of barcodes with more than one target after target clustering", True),
@@ -298,18 +300,17 @@ def write_stats(path, stats):
         Returns:
                 -- str: e.g. '74.69', or 'NA'
         """
-        return "%.2f" % (100.0 * row.count / total) if row.is_reads and total else "NA"
+        return f"{100.0 * row.count / total:.2f}" if row.is_reads and total else "NA"
 
     # step2 : the file
     with open(path, "w") as fo:
         fo.write("step\tstat\tcount\tpercent\tdescription\n")
         for row in stats:
-            fo.write("%s\t%s\t%s\t%s\t%s\n" % (row.step, row.stat, row.count, percent(row),
-                                               row.description))
+            fo.write(f"{row.step}\t{row.stat}\t{row.count}\t{percent(row)}\t{row.description}\n")
     # step3 : the log, one block per step
     step = None
     for row in stats:
         if row.step != step:
             step = row.step
             log_sub(step)
-        log_sub("    %-36s %14s %8s" % (row.stat, row.count, percent(row)))
+        log_sub(f"    {row.stat!s:<36} {row.count!s:>14} {percent(row):>8}")

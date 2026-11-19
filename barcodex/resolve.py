@@ -36,8 +36,14 @@ def pairs_csv(src):
     Returns:
             -- str: read_csv(...) expression
     """
-    return ("read_csv(%s, delim='\t', header=true, quote='', escape='', columns=%s)"
-            % (sql_str(src), PAIR_COLUMNS))
+    return (
+        f"read_csv({sql_str(src)}, "
+        "delim='\t', "
+        "header=true, "
+        "quote='', "
+        "escape='', "
+        f"columns={PAIR_COLUMNS})"
+    )
 
 
 # ---- steps -----------------------------------------------------------------
@@ -115,13 +121,18 @@ def assign_targets(con, args, barcode_meta):
     con.execute("DROP VIEW bt")
     con.execute("DROP TABLE target_ids")
     #      |----   substep report the number of barcodes per status
-    for status, n in con.execute(
-            "SELECT status, COUNT(*) FROM barcode_assign GROUP BY status ORDER BY 2 DESC").fetchall():
-        log_sub("barcodes %-13s %d" % (status, n))
+    status_counts = con.execute(
+        "SELECT status, COUNT(*) "
+        "FROM barcode_assign "
+        "GROUP BY status "
+        "ORDER BY 2 DESC"
+    ).fetchall()
+    for status, n in status_counts:
+        log_sub(f"barcodes {status:<13} {n}")
 
     # step4 : final pairs = barcodes whose status is unique / resolved, with their S2 statistics
     #   barcode_clusters.parquet holds every barcode cluster: the inner join keeps all final rows
-    con.execute("""
+    con.execute(f"""
         CREATE OR REPLACE TABLE final AS
         SELECT a.bk, a.tk, a.target_id, a.pair_reads, a.barcode_reads, a.n_variants,
                a.first_cov, a.second_cov,
@@ -129,9 +140,9 @@ def assign_targets(con, args, barcode_meta):
                m.first_cov AS bc_first_cov, m.second_cov AS bc_second_cov
         FROM barcode_assign a
         JOIN (SELECT md5_number(barcode) AS bk, "count", n_cluster, first_cov, second_cov
-              FROM read_parquet(%s)) m USING (bk)
+              FROM read_parquet({sql_str(barcode_meta)})) m USING (bk)
         WHERE a.status IN ('unique', 'resolved')
-    """ % sql_str(barcode_meta))
+    """)
 
 
 def final_rows_sql(src):
@@ -143,9 +154,11 @@ def final_rows_sql(src):
     Returns:
             -- str: SQL query returning barcode, target and the columns of table final
     """
-    return ("SELECT c.barcode, c.target_seq AS target, f.* FROM %s c "
-            "JOIN final f ON f.bk = md5_number(c.barcode) AND f.tk = md5_number(c.target_seq)"
-            % pairs_csv(src))
+    return (
+        "SELECT c.barcode, c.target_seq AS target, f.* "
+        f"FROM {pairs_csv(src)} c "
+        "JOIN final f ON f.bk = md5_number(c.barcode) AND f.tk = md5_number(c.target_seq)"
+    )
 
 
 def write_details_file(con, args, src):
@@ -173,8 +186,8 @@ def write_details_file(con, args, src):
     #     first_/second_target_cov    = reads of the most / second most abundant target sequence
     #     first_/second_target_ratio  = cov / target_reads
     out = args.out + ".barcode_target.details.tsv"
-    log_sub("writing %s" % out)
-    con.execute("""
+    log_sub(f"writing {out}")
+    con.execute(f"""
         COPY (SELECT barcode, target,
                      bc_count AS barcode_reads,
                      bc_n_cluster AS n_diff_barcodes,
@@ -188,9 +201,9 @@ def write_details_file(con, args, src):
                      round(first_cov * 1.0 / pair_reads, 4) AS first_target_ratio,
                      second_cov AS second_target_cov,
                      round(second_cov * 1.0 / pair_reads, 4) AS second_target_ratio
-              FROM (%s)
+              FROM ({final_rows_sql(src)})
               ORDER BY bc_count DESC, pair_reads DESC, barcode)
-        TO %s (DELIMITER '\t', HEADER)""" % (final_rows_sql(src), sql_str(out)))
+        TO {sql_str(out)} (DELIMITER '\t', HEADER)""")
 
 
 # ---- stage driver ----------------------------------------------------------
@@ -219,7 +232,7 @@ def resolve_pairs(args, threads):
     raw_stats_file = meta_path(args, "raw_stats.json")
     for f in (src, barcode_meta, raw_stats_file):
         if not os.path.exists(f):
-            raise SystemExit("ERROR: %s not found (run all steps first)" % f)
+            raise SystemExit(f"ERROR: {f} not found (run all steps first)")
     with open(raw_stats_file) as fh:
         raw_stats = json.load(fh)
     #      |----   substep ingest_stats.json is missing for work directories of older versions
@@ -233,19 +246,20 @@ def resolve_pairs(args, threads):
     #      |----   substep DuckDB with the --mem_gb / --threads limits and a spill directory
     con = duckdb.connect(args.db or ":memory:")
     spill = args.out + ".duckdb.tmp"
-    con.execute("SET threads=%d" % threads)
-    con.execute("SET memory_limit=%s" % sql_str("%dMB" % int(args.mem_gb * 1000)))
-    con.execute("SET temp_directory=%s" % sql_str(spill))
+    memory_mb = int(args.mem_gb * 1000)
+    con.execute(f"SET threads={threads}")
+    con.execute(f"SET memory_limit={sql_str(f'{memory_mb}MB')}")
+    con.execute(f"SET temp_directory={sql_str(spill)}")
     con.execute("SET preserve_insertion_order=false")      # lets DuckDB stream/spill freely
 
     # step2 : load the (barcode, target cluster) pairs, sequences replaced by their md5 keys
     log_sub("loading (barcode, target cluster) pairs")
-    con.execute("""
+    con.execute(f"""
         CREATE OR REPLACE TABLE pairs AS
         SELECT md5_number(barcode) AS bk, md5_number(target_seq) AS tk,
                barcode_reads, target_reads, target_unique, first_cov, second_cov
-        FROM %s
-    """ % pairs_csv(src))
+        FROM {pairs_csv(src)}
+    """)
 
     # step3 : distinct targets with their reads (for the target ids)
     con.execute("""
@@ -261,7 +275,7 @@ def resolve_pairs(args, threads):
 
     # step5 : result files
     write_details_file(con, args, src)
-    log_sub("writing %s" % (args.out + ".stats.tsv"))
+    log_sub(f"writing {args.out}.stats.tsv")
     write_stats(args.out + ".stats.tsv", stats)
 
     # step6 : release DuckDB, delete the spill directory and (--clean_meta) the meta directory

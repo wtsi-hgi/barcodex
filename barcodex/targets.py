@@ -195,21 +195,21 @@ def run_groups(rows, out_clusters, out_barcode_fq, out_target_fq, params, long_g
         """
         total_reads = sum(t[0] for t in items)
         if len(items) > long_group_note:
-            log_sub("NOTE: barcode %s has %d reads and %d distinct targets (junk/low-complexity "
-                "barcode?); top-%d parents only, no indel search"
-                % (barcode, total_reads, len(items), S4_STATE["max_parents"]))
+            log_sub(f"NOTE: barcode {barcode} has {total_reads} reads and {len(items)} distinct targets "
+                    f"(junk/low-complexity barcode?); top-{S4_STATE['max_parents']} parents only, "
+                    "no indel search")
         #      |----   substep cluster the targets of this barcode
         clusters = cluster_group(items, params)
         clusters.sort(key=lambda t: -t[0])
         #      |----   substep one output line per target cluster (and the optional FASTQ pair)
         for rank, (reads, n_unique, seq, first_cov, second_cov) in enumerate(clusters, 1):
-            out_clusters.write("%s\t%d\t%d\t%d\t%d\t%s\t%d\t%d\n"
-                               % (barcode, total_reads, rank, reads, n_unique, seq.decode(),
-                                  first_cov, second_cov))
+            target_seq = seq.decode()
+            out_clusters.write(f"{barcode}\t{total_reads}\t{rank}\t{reads}\t{n_unique}\t"
+                               f"{target_seq}\t{first_cov}\t{second_cov}\n")
             if out_barcode_fq:
-                header = "@%s_%d reads=%d" % (barcode, rank, reads)
-                out_barcode_fq.write("%s/1\n%s\n+\n%s\n" % (header, barcode, "I" * len(barcode)))
-                out_target_fq.write("%s/2\n%s\n+\n%s\n" % (header, seq.decode(), "I" * len(seq)))
+                header = f"@{barcode}_{rank} reads={reads}"
+                out_barcode_fq.write(f"{header}/1\n{barcode}\n+\n{'I' * len(barcode)}\n")
+                out_target_fq.write(f"{header}/2\n{target_seq}\n+\n{'I' * len(seq)}\n")
         state["n_barcodes"] += 1
         state["n_clusters"] += len(clusters)
         state["n_reads"] += total_reads
@@ -227,8 +227,8 @@ def run_groups(rows, out_clusters, out_barcode_fq, out_target_fq, params, long_g
         #      |----   substep skip corrupt targets (non-ACGT bytes cannot be packed; ingest writes ACGT only)
         target_bytes = target.encode()
         if target_bytes.translate(None, b"ACGT"):
-            log_sub("WARNING: skipped a target with non-ACGT bytes (barcode %s, %d reads): %r"
-                    % (centre, count, target_bytes))
+            log_sub(f"WARNING: skipped a target with non-ACGT bytes (barcode {centre}, {count} reads): "
+                    f"{target_bytes!r}")
             continue
         #      |----   substep pack the target: 2 bits per base + one length byte
         length = len(target_bytes)
@@ -273,11 +273,14 @@ def shard_rows(shard):
     """
     # step1 : locate the shard and open a one-thread DuckDB
     state = S4_STATE
-    shard_dir = "%s/shards/shard=%d" % (state["work"], shard)
-    con = open_duckdb(state["work"], 1, state["s4_mem_gb"], "s4_%d" % shard)
+    shard_dir = f"{state['work']}/shards/shard={shard}"
+    con = open_duckdb(state["work"], 1, state["s4_mem_gb"], f"s4_{shard}")
     # step2 : ordered scan: all rows of one barcode centre are adjacent
-    cursor = con.execute("SELECT centre, target, cnt, tm0, tm1, tm2, tm3 FROM read_parquet(%s) "
-                         "ORDER BY centre" % sql_str(shard_dir + "/*.parquet"))
+    cursor = con.execute(
+        "SELECT centre, target, cnt, tm0, tm1, tm2, tm3 "
+        f"FROM read_parquet({sql_str(shard_dir + '/*.parquet')}) "
+        "ORDER BY centre"
+    )
     # step3 : stream the rows in blocks of 50000 (bounded memory)
     while True:
         rows = cursor.fetchmany(50000)
@@ -300,16 +303,16 @@ def process_shard(shard):
     # step1 : locate the shard; skip it when finished (resume) or empty
     state = S4_STATE
     work = state["work"]
-    final = "%s/res%05d.tsv" % (work, shard)
-    shard_dir = "%s/shards/shard=%d" % (work, shard)
+    final = f"{work}/res{shard:05d}.tsv"
+    shard_dir = f"{work}/shards/shard={shard}"
     if os.path.exists(final) or not glob.glob(shard_dir + "/*.parquet"):
         return 0, 0, 0
     # step2 : open the output files (.tmp files are published at the end)
     out_clusters = open(final + ".tmp", "w")
     out_barcode_fq = out_target_fq = None
     if state["fastq"]:
-        out_barcode_fq = open("%s/res%05d.bc.fq" % (work, shard), "w")
-        out_target_fq = open("%s/res%05d.tg.fq" % (work, shard), "w")
+        out_barcode_fq = open(f"{work}/res{shard:05d}.bc.fq", "w")
+        out_target_fq = open(f"{work}/res{shard:05d}.tg.fq", "w")
     # step3 : cluster all barcodes of the shard
     result = run_groups(shard_rows(shard), out_clusters, out_barcode_fq, out_target_fq,
                         state["params"])
@@ -379,9 +382,9 @@ def stage_targets(args, work, threads, mem_gb, n_shards):
     need_gb = max(S4_MIN_MEM_GB, S4_MEM_PER_SHARD_GB * largest_gb)
     workers = max(1, min(threads, int(mem_gb * 0.7 / need_gb)))
     if workers < threads:
-        log_sub("largest shard %.2f GB: %d S4 worker(s) with %.1f GB DuckDB memory each "
-                "(more --mem_gb or --shards allows more workers)"
-                % (largest_gb, workers, mem_gb * 0.7 / workers))
+        worker_gb = mem_gb * 0.7 / workers
+        log_sub(f"largest shard {largest_gb:.2f} GB: {workers} S4 worker(s) with {worker_gb:.1f} GB "
+                "DuckDB memory each (more --mem_gb or --shards allows more workers)")
     cfg = dict(work=work, fastq=args.fastq, keep_tmp=args.keep_tmp,
                max_parents=max(1, args.max_parents), max_dp_group=args.max_dp_group,
                s4_mem_gb=max(0.5, mem_gb * 0.7 / workers),
@@ -399,14 +402,14 @@ def stage_targets(args, work, threads, mem_gb, n_shards):
         n_reads += reads_i
         n_done += 1
         if n_done % max(1, n_shards // 10) == 0:
-            log_sub("%d/%d shards" % (n_done, n_shards))
+            log_sub(f"{n_done}/{n_shards} shards")
 
     # step3 : concatenate the shard files in shard order
-    def concatenate(name_format, dest, header=None):
+    def concatenate(ext, dest, header=None):
         """
         Append the per-shard files (in shard order) to dest, deleting them.
         Parameters:
-                -- name_format: str: '%s/res%05d.<ext>' pattern filled with (work, shard)
+                -- ext: str: extension of the per-shard files <work>/res<shard>.<ext>
                 -- dest: str: output file
                 -- header: str or None: header line written first
         Returns:
@@ -416,7 +419,7 @@ def stage_targets(args, work, threads, mem_gb, n_shards):
             if header:
                 fo.write(header.encode())
             for shard in range(n_shards):
-                path = name_format % (work, shard)
+                path = f"{work}/res{shard:05d}.{ext}"
                 if os.path.exists(path):
                     with open(path, "rb") as fi:
                         shutil.copyfileobj(fi, fo, 1 << 22)
@@ -424,13 +427,13 @@ def stage_targets(args, work, threads, mem_gb, n_shards):
 
     #      |----   substep meta/target_pairs.tsv = input of S5
     os.makedirs(meta_path(args), exist_ok=True)
-    concatenate("%s/res%05d.tsv", meta_path(args, "target_pairs.tsv"),
+    concatenate("tsv", meta_path(args, "target_pairs.tsv"),
                 "barcode\tbarcode_reads\ttarget_rank\ttarget_reads\ttarget_unique\ttarget_seq\t"
                 "first_cov\tsecond_cov\n")
     #      |----   substep optional representative FASTQ pair
     if args.fastq:
-        concatenate("%s/res%05d.bc.fq", args.out + "_barcode.fastq")
-        concatenate("%s/res%05d.tg.fq", args.out + "_target.fastq")
+        concatenate("bc.fq", args.out + "_barcode.fastq")
+        concatenate("tg.fq", args.out + "_target.fastq")
     # step4 : report the totals
-    log_sub("S4 done: %d reads, %d barcode clusters with reads, %d (barcode, target) clusters"
-        % (n_reads, n_barcodes, n_clusters))
+    log_sub(f"S4 done: {n_reads} reads, {n_barcodes} barcode clusters with reads, "
+            f"{n_clusters} (barcode, target) clusters")

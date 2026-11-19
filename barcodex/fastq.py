@@ -116,7 +116,7 @@ def reader_proc(paths, chunk_records, use_pigz, max_reads, worker_queues, result
                         break
                     #      |----   substep a partial record means a truncated file
                     if len(lines) % 4:
-                        raise RuntimeError("truncated FASTQ: %s" % path)
+                        raise RuntimeError(f"truncated FASTQ: {path}")
                     n_records = len(lines) // 4
                     #      |----   substep chunk i goes to worker i % n_workers (the same rule is used for the barcode and the target reader)
                     if not put_abortable(worker_queues[chunk_no % n_workers],

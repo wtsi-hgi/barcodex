@@ -134,8 +134,9 @@ def ingest_chunk(barcode_chunk, target_chunk, cfg, agg, tables, extractors, reje
         target = target_full[tg_start:tg_end]
         #      |----   substep quality-aware barcodes > 32 bp do not fit the mask (targets > 255 bp: see check)
         if use_barcode_qual and bc_end - bc_start > MAX_QUAL_BARCODE_LEN:
-            raise RuntimeError("barcode longer than %d bp: quality-aware barcode clustering "
-                               "is not possible; use --barcode_max_lowq 0" % MAX_QUAL_BARCODE_LEN)
+            raise RuntimeError(f"barcode longer than {MAX_QUAL_BARCODE_LEN} bp: "
+                               "quality-aware barcode clustering is not possible; "
+                               "use --barcode_max_lowq 0")
 
         #      |----   substep aggregation key = barcode TAB target (non-ACGT target bases become 'A')
         key = barcode + b"\t" + target.translate(to_acgt)
@@ -198,7 +199,7 @@ def flush_part(agg, parts_dir, worker_id, part_no, max_parts, abort):
         time.sleep(2)
     # step2 : write the dictionary as a gz text part, 20000 lines per write
     #      |----   substep value = (mask << 32) | count  ->  count, target mask (four 64-bit words), barcode mask
-    name = "%s/w%03d_%06d" % (parts_dir, worker_id, part_no)
+    name = f"{parts_dir}/w{worker_id:03d}_{part_no:06d}"
     target_mask_all = (1 << TARGET_MASK_BITS) - 1
     with gzip.open(name + ".tmp", "wb", 1) as fo:
         lines = []
@@ -278,7 +279,7 @@ def ingest_worker(worker_id, barcode_queue, target_queue, result_queue, progress
             flush_part(agg, parts_dir, worker_id, part_no, 0, abort)
         result_queue.put(("done", worker_id, n_read, rejects))
     except BaseException:
-        result_queue.put(("error", "worker %d" % worker_id, traceback.format_exc()))
+        result_queue.put(("error", f"worker {worker_id}", traceback.format_exc()))
 
 
 # ---- stage helpers ---------------------------------------------------------
@@ -297,14 +298,14 @@ def decide_quality(args, barcode_spec, read_len):
     barcode_len_max = max_length(barcode_spec, read_len)
     #      |----   substep warn for very long barcodes (the tuple store then approaches one row per read)
     if barcode_len_max > 64:
-        log_sub("NOTE: barcode up to %d bp (read length %d). Whole-read / variant barcodes are "
-                "fine, but if most reads are distinct the tuple store approaches one row per "
-                "read (disk!)" % (barcode_len_max, read_len))
+        log_sub(f"NOTE: barcode up to {barcode_len_max} bp (read length {read_len}). "
+                "Whole-read / variant barcodes are fine, "
+                "but if most reads are distinct the tuple store approaches one row per read (disk!)")
     #      |----   substep barcode quality needs barcodes <= 32 bp (one 64-bit word) and --barcode_max_lowq > 0
     use_barcode_qual = args.barcode_max_lowq > 0 and barcode_len_max <= MAX_QUAL_BARCODE_LEN
     if args.barcode_max_lowq > 0 and not use_barcode_qual:
-        log_sub("NOTE: barcode can be %d bp (> %d): barcode quality is NOT used (sequence-only)"
-                % (barcode_len_max, MAX_QUAL_BARCODE_LEN))
+        log_sub(f"NOTE: barcode can be {barcode_len_max} bp (> {MAX_QUAL_BARCODE_LEN}): "
+                "barcode quality is NOT used (sequence-only)")
     #      |----   substep target quality is on whenever --target_max_lowq > 0
     return barcode_len_max, use_barcode_qual, args.target_max_lowq > 0
 
@@ -318,17 +319,17 @@ def describe_spec(spec):
             -- str: e.g. 'flank: GTCC...ATCT / TGGT...ACCA (<= 2 mismatches)'
     """
     if spec.method == "pos":
-        text = "pos: start %d, length %s" % (spec.start, spec.length or "to read end")
+        text = f"pos: start {spec.start}, length {spec.length or 'to read end'}"
     elif spec.method == "flank":
-        text = "flank: %s / %s (<= %d edits)" % (spec.up, spec.down, spec.flank_mismatch)
+        text = f"flank: {spec.up} / {spec.down} (<= {spec.flank_mismatch} edits)"
     else:
         text = "none: whole read"
     if spec.min_len:
-        text += ", length >= %d" % spec.min_len
+        text += f", length >= {spec.min_len}"
     if spec.allowed_lens:
-        text += ", lengths %d-%d only" % (min(spec.allowed_lens), max(spec.allowed_lens))
+        text += f", lengths {min(spec.allowed_lens)}-{max(spec.allowed_lens)} only"
     if spec.template:
-        text += ", template %s (<= %d mismatches)" % (spec.template, spec.template_mismatch)
+        text += f", template {spec.template} (<= {spec.template_mismatch} mismatches)"
     return text
 
 
@@ -400,12 +401,13 @@ def stage_ingest(args, work, threads, mem_gb):
                phred_offset=args.phred_offset,
                target_min_qual=args.target_min_qual, barcode_min_qual=args.barcode_min_qual,
                cap=cap, parts_dir=parts_dir, max_parts=max(args.compact_parts * 4, 8))
-    log("S1: ingest  (%d workers, <=%d aggregated entries/worker, barcode <= %d bp, "
-        "barcode quality %s, target quality %s)"
-        % (n_workers, cap, barcode_len_max, "on" if use_barcode_qual else "off",
-           "on" if use_target_qual else "off"))
-    log_sub("barcode: %s" % describe_spec(barcode_spec))
-    log_sub("target : %s" % describe_spec(target_spec))
+    barcode_qual_text = "on" if use_barcode_qual else "off"
+    target_qual_text = "on" if use_target_qual else "off"
+    log(f"S1: ingest  ({n_workers} workers, <={cap} aggregated entries/worker, "
+        f"barcode <= {barcode_len_max} bp, "
+        f"barcode quality {barcode_qual_text}, target quality {target_qual_text})")
+    log_sub(f"barcode: {describe_spec(barcode_spec)}")
+    log_sub(f"target : {describe_spec(target_spec)}")
 
     # step3 : start the reader / parse-worker processes and the background compactor
     #      |----   substep abort flag, result queue and bounded chunk queues (QUEUE_DEPTH per worker and role)
@@ -460,7 +462,7 @@ def stage_ingest(args, work, threads, mem_gb):
             message = None
         if message is not None:
             if message[0] == "error":
-                die("ERROR in %s:\n%s" % (message[1], message[2]))
+                die(f"ERROR in {message[1]}:\n{message[2]}")
             n_done += 1
             n_reads += message[2]
             for key, n in message[3].items():
@@ -473,14 +475,14 @@ def stage_ingest(args, work, threads, mem_gb):
         for p in processes:
             #      |----   substep stop when a worker / reader died (usually out of memory)
             if p.exitcode not in (None, 0):
-                die("ERROR: a worker/reader process died (exit code %s) - out of memory? "
-                    "lower --threads / --agg_entries / --chunk" % p.exitcode)
+                die(f"ERROR: a worker/reader process died (exit code {p.exitcode}) - out of memory? "
+                    "lower --threads / --agg_entries / --chunk")
         #      |----   substep progress line once a minute
         if time.time() - last_log > 60:
             last_log = time.time()
             total = sum(progress)
-            log_sub("%d reads parsed (%.1f M/s)"
-                    % (total, total / 1e6 / max(1.0, time.time() - ingest_start)))
+            rate = total / 1e6 / max(1.0, time.time() - ingest_start)
+            log_sub(f"{total} reads parsed ({rate:.1f} M/s)")
     # step5 : wait for the processes, finish the compaction and close the stage
     for p in processes:
         p.join(60)
@@ -491,10 +493,11 @@ def stage_ingest(args, work, threads, mem_gb):
         die(str(e))
     #      |----   substep report the reject reasons and save them for the stats file (S5)
     n_rejected = sum(rejects.values())
-    log_sub("ingest done: %d read pairs, %d rejected; tuple store %.2f GB"
-            % (n_reads, n_rejected, dir_gb(tuples_dir, "t*.parquet")))
+    tuples_gb = dir_gb(tuples_dir, "t*.parquet")
+    log_sub(f"ingest done: {n_reads} read pairs, {n_rejected} rejected; "
+            f"tuple store {tuples_gb:.2f} GB")
     for key, n in sorted(rejects.items(), key=lambda kv: -kv[1]):
-        log_sub("  rejected %-30s %d" % (key, n))
+        log_sub(f"  rejected {key:<30} {n}")
     write_ingest_stats(args, (barcode_spec, target_spec), n_reads, rejects)
     #      |----   substep sanity check: the tuple store must not be empty
     if not glob.glob(tuples_dir + "/t*.parquet"):
@@ -502,5 +505,5 @@ def stage_ingest(args, work, threads, mem_gb):
                          "(see the reject counts above)")
     #      |----   substep marker file used by --resume
     with open(work + "/ingest.done", "w") as fo:
-        fo.write("%d\n" % n_reads)
+        fo.write(f"{n_reads}\n")
     return n_reads

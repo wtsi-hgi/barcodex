@@ -25,31 +25,32 @@ def stage_shards(args, work, threads, mem_gb, n_shards):
     Returns:
             -- None: nothing; results are files in <work>/shards/shard=<n>/
     """
-    log("S3: re-keying tuples by corrected barcode into %d shard(s) ..." % n_shards)
+    log(f"S3: re-keying tuples by corrected barcode into {n_shards} shard(s) ...")
     # step1 : remove old shards and open DuckDB
     shards_dir = work + "/shards"
     shutil.rmtree(shards_dir, ignore_errors=True)
     con = open_duckdb(work, threads, mem_gb * 0.85, "shard")
     # step2 : tuples JOIN barcode map -> (centre, target) rows; counts add, masks AND; write shards by hash(centre)
     #   the join key is md5_number(barcode) (128 bit): the hash table holds no barcode strings
-    n_rows = con.execute("""
+    tuples = sql_str(work + "/tuples/t*.parquet")
+    bcmap = sql_str(work + "/bcmap.parquet")
+    n_rows = con.execute(f"""
         COPY (
             SELECT m.centre AS centre, t.target AS target, SUM(t.cnt)::UBIGINT AS cnt,
                    bit_and(t.tm0) AS tm0, bit_and(t.tm1) AS tm1,
                    bit_and(t.tm2) AS tm2, bit_and(t.tm3) AS tm3,
-                   (hash(m.centre) %% %d)::INTEGER AS shard
-            FROM read_parquet(%s) t
-            JOIN (SELECT md5_number(barcode) AS bk, centre FROM read_parquet(%s)) m
+                   (hash(m.centre) % {n_shards})::INTEGER AS shard
+            FROM read_parquet({tuples}) t
+            JOIN (SELECT md5_number(barcode) AS bk, centre FROM read_parquet({bcmap})) m
               ON md5_number(t.barcode) = m.bk
             GROUP BY m.centre, t.target
-        ) TO %s (FORMAT PARQUET, PARTITION_BY (shard), COMPRESSION ZSTD)
-    """ % (n_shards, sql_str(work + "/tuples/t*.parquet"), sql_str(work + "/bcmap.parquet"),
-           sql_str(shards_dir))).fetchone()[0]
+        ) TO {sql_str(shards_dir)} (FORMAT PARQUET, PARTITION_BY (shard), COMPRESSION ZSTD)
+    """).fetchone()[0]
     con.close()
     # step3 : report the size of the shards
     shard_gb = sum(os.path.getsize(os.path.join(d, f))
                    for d, _, files in os.walk(shards_dir) for f in files) / 1e9
-    log_sub("%d distinct (barcode cluster, target sequence) rows; shards %.2f GB" % (n_rows, shard_gb))
+    log_sub(f"{n_rows} distinct (barcode cluster, target sequence) rows; shards {shard_gb:.2f} GB")
     # step4 : free disk space: delete the tuple store and bcmap.parquet
     if not args.keep_tmp:
         shutil.rmtree(work + "/tuples", ignore_errors=True)
@@ -57,4 +58,4 @@ def stage_shards(args, work, threads, mem_gb, n_shards):
             os.remove(work + "/bcmap.parquet")
     # step5 : marker file used by --resume
     with open(work + "/shards.done", "w") as fo:
-        fo.write("%d\n" % n_shards)
+        fo.write(f"{n_shards}\n")

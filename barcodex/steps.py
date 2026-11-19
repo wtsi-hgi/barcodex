@@ -26,7 +26,7 @@ def prepare_work_dir(args):
     base_dir = args.tmp if args.tmp else os.path.dirname(os.path.abspath(args.out))
     work = os.path.join(base_dir, os.path.basename(args.out) + ".work")
     if args.resume and os.path.isdir(work):
-        log("Resuming from existing temporary directory %s." % work)
+        log(f"Resuming from existing temporary directory {work}.")
     else:
         shutil.rmtree(work, ignore_errors=True)
         shutil.rmtree(meta_path(args), ignore_errors=True)
@@ -45,7 +45,7 @@ def run_steps(args, threads):
     """
     # step1 : resources and work directory
     mem_gb = args.mem_gb
-    log("resources: %d process(es), %.1f GB RAM budget" % (threads, mem_gb))
+    log(f"resources: {threads} process(es), {mem_gb:.1f} GB RAM budget")
     work = prepare_work_dir(args)
     n_shards = max(1, args.shards)
 

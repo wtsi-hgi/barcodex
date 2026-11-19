@@ -35,16 +35,30 @@ def compaction_sql(part_files, parquet_files, out_file):
     # step1 : one sub-query per input kind (text parts and / or Parquet files)
     sources = []
     if part_files:
-        sources.append("SELECT * FROM read_csv(%s, delim='\t', header=false, columns=%s, "
-                       "compression='gzip')" % (sql_list(part_files), PART_COLUMNS))
+        sources.append(
+            "SELECT * "
+            f"FROM read_csv({sql_list(part_files)}, "
+            "delim='\t', "
+            "header=false, "
+            f"columns={PART_COLUMNS}, "
+            "compression='gzip')"
+        )
     if parquet_files:
-        sources.append("SELECT * FROM read_parquet(%s)" % sql_list(parquet_files))
+        sources.append(f"SELECT * FROM read_parquet({sql_list(parquet_files)})")
     # step2 : merge rows with the same (barcode, target): counts add up, masks are AND-ed; write ZSTD Parquet
-    return ("COPY (SELECT barcode, target, SUM(cnt)::UBIGINT AS cnt, "
-            "bit_and(tm0) AS tm0, bit_and(tm1) AS tm1, bit_and(tm2) AS tm2, "
-            "bit_and(tm3) AS tm3, bit_and(bm) AS bm FROM (%s) "
-            "GROUP BY barcode, target) TO %s (FORMAT PARQUET, COMPRESSION ZSTD)"
-            % (" UNION ALL ".join(sources), sql_str(out_file)))
+    union = " UNION ALL ".join(sources)
+    return (
+        "COPY (SELECT barcode, target, "
+        "SUM(cnt)::UBIGINT AS cnt, "
+        "bit_and(tm0) AS tm0, "
+        "bit_and(tm1) AS tm1, "
+        "bit_and(tm2) AS tm2, "
+        "bit_and(tm3) AS tm3, "
+        "bit_and(bm) AS bm "
+        f"FROM ({union}) "
+        "GROUP BY barcode, target) "
+        f"TO {sql_str(out_file)} (FORMAT PARQUET, COMPRESSION ZSTD)"
+    )
 
 
 def validation_sql(parquet_file):
@@ -56,9 +70,13 @@ def validation_sql(parquet_file):
     Returns:
             -- str: SELECT statement returning one row (n_bad, reads)
     """
-    return ("SELECT COUNT(*) FILTER (WHERE regexp_matches(barcode, '[^\\x21-\\x7e]') "
-            "OR regexp_matches(target, '[^\\x21-\\x7e]')), SUM(cnt) FROM read_parquet(%s)"
-            % sql_str(parquet_file))
+    return (
+        "SELECT COUNT(*) FILTER ("
+        "WHERE regexp_matches(barcode, '[^\\x21-\\x7e]') "
+        "OR regexp_matches(target, '[^\\x21-\\x7e]')), "
+        "SUM(cnt) "
+        f"FROM read_parquet({sql_str(parquet_file)})"
+    )
 
 
 class CorruptOutput(Exception):
@@ -119,7 +137,7 @@ class Compactor:
             return 1, parts, []
         # step2 : levels 2..4: merge `fanout` same-level Parquet files into the next level
         for level in (1, 2, 3):
-            files = sorted(glob.glob("%s/t%d_*.parquet" % (self.tuples_dir, level)))
+            files = sorted(glob.glob(f"{self.tuples_dir}/t{level}_*.parquet"))
             if len(files) >= self.fanout:
                 return level + 1, [], files
         return None
@@ -155,12 +173,14 @@ class Compactor:
         try:
             n_bad, reads_out = con.execute(validation_sql(tmp_out)).fetchone()
             if n_bad:
-                raise CorruptOutput("%d row(s) with non-printable bytes in %s" % (n_bad, tmp_out))
+                raise CorruptOutput(f"{n_bad} row(s) with non-printable bytes in {tmp_out}")
             if parquet_files:
-                reads_in = con.execute("SELECT SUM(cnt) FROM read_parquet(%s)"
-                                       % sql_list(parquet_files)).fetchone()[0]
+                reads_in = con.execute(
+                    "SELECT SUM(cnt) "
+                    f"FROM read_parquet({sql_list(parquet_files)})"
+                ).fetchone()[0]
                 if reads_in != reads_out:
-                    raise CorruptOutput("read count changed: %s in, %s out" % (reads_in, reads_out))
+                    raise CorruptOutput(f"read count changed: {reads_in} in, {reads_out} out")
         finally:
             con.close()
 
@@ -177,7 +197,7 @@ class Compactor:
             # step1 : name the output file t<level>_<sequence>.parquet
             level, part_files, parquet_files = job
             self.sequence += 1
-            out = "%s/t%d_%06d.parquet" % (self.tuples_dir, level, self.sequence)
+            out = f"{self.tuples_dir}/t{level}_{self.sequence:06d}.parquet"
             # step2 : compact into <out>.tmp, then validate it; retry on a failed read or a corrupt
             #         output.  Seen in full-size runs (DuckDB 2.0.0, Lustre): transient read errors on
             #         files that read fine afterwards, and output files with garbage bytes inside a
@@ -193,17 +213,18 @@ class Compactor:
                         os.remove(out + ".tmp")
                     if attempt == COMPACT_ATTEMPTS:
                         raise
-                    log_sub("WARNING: compaction attempt %d/%d failed, retrying: %s"
-                            % (attempt, COMPACT_ATTEMPTS, str(e).splitlines()[0][:300]))
+                    reason = str(e).splitlines()[0][:300]
+                    log_sub(f"WARNING: compaction attempt {attempt}/{COMPACT_ATTEMPTS} failed, "
+                            f"retrying: {reason}")
                     time.sleep(30)
             # step3 : publish atomically, then delete the inputs
             os.replace(out + ".tmp", out)
             for f in part_files + parquet_files:
                 os.remove(f)
             # step4 : report
-            log_sub("compacted %d part(s) + %d file(s) -> L%d: %d rows (%.2f GB on disk in tuples/)"
-                % (len(part_files), len(parquet_files), level, n_rows,
-                   dir_gb(self.tuples_dir, "t*.parquet")))
+            tuples_gb = dir_gb(self.tuples_dir, "t*.parquet")
+            log_sub(f"compacted {len(part_files)} part(s) + {len(parquet_files)} file(s) -> L{level}: "
+                    f"{n_rows} rows ({tuples_gb:.2f} GB on disk in tuples/)")
         except BaseException:
             self.error = traceback.format_exc()
 

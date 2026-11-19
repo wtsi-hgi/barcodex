@@ -128,9 +128,10 @@ def open_duckdb(work, threads, mem_gb, name, path=":memory:"):
     #      |----   substep threads, memory_limit and a private spill directory
     #      |----   substep preserve_insertion_order=false lets DuckDB stream / spill freely
     con = duckdb.connect(path)
-    con.execute("SET threads=%d" % max(1, threads))
-    con.execute("SET memory_limit=%s" % sql_str("%dMB" % max(300, int(mem_gb * 1000))))
-    con.execute("SET temp_directory=%s" % sql_str(os.path.join(work, "duck_" + name)))
+    memory_mb = max(300, int(mem_gb * 1000))
+    con.execute(f"SET threads={max(1, threads)}")
+    con.execute(f"SET memory_limit={sql_str(f'{memory_mb}MB')}")
+    con.execute(f"SET temp_directory={sql_str(os.path.join(work, 'duck_' + name))}")
     con.execute("SET preserve_insertion_order=false")      # lets DuckDB stream/spill freely
     return con
 

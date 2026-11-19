@@ -41,28 +41,45 @@ def packed_barcode_sql(max_len, fixed_len):
     for i in range(max_len):
         #    |---- substep constant shifts when all barcodes have the same length, else shifts computed from length(b)
         if fixed_len:
-            bit_shift = "%d" % (fixed_len - 1 - i)
-            lane_shift = "%d" % (2 * (fixed_len - 1 - i))
+            bit_shift = f"{fixed_len - 1 - i}"
+            lane_shift = f"{2 * (fixed_len - 1 - i)}"
         else:
-            bit_shift = "greatest(length(b) - 1 - %d, 0)" % i
-            lane_shift = "(2 * %s)" % bit_shift
+            bit_shift = f"greatest(length(b) - 1 - {i}, 0)"
+            lane_shift = f"(2 * {bit_shift})"
         #    |---- substep code lane: A=0 C=1 G=2 T=3 (anything else = 0)
-        code = ("(CASE substr(b, %d, 1) WHEN 'C' THEN 1 WHEN 'G' THEN 2 WHEN 'T' THEN 3 ELSE 0 END)"
-                "::UBIGINT << (%s)::UBIGINT" % (i + 1, lane_shift))
+        code = (
+            f"(CASE substr(b, {i + 1}, 1) "
+            "WHEN 'C' THEN 1 "
+            "WHEN 'G' THEN 2 "
+            "WHEN 'T' THEN 3 "
+            "ELSE 0 END)"
+            f"::UBIGINT << ({lane_shift})::UBIGINT"
+        )
         #    |---- substep confidence lane: 1 when the mask bit of the base is 0 (confident)
-        conf = ("(1::UBIGINT - ((bm >> (%s)::UBIGINT) & 1::UBIGINT)) << (%s)::UBIGINT"
-                % (bit_shift, lane_shift))
+        conf = (
+            "(1::UBIGINT - "
+            f"((bm >> ({bit_shift})::UBIGINT) & 1::UBIGINT))"
+            f" << ({lane_shift})::UBIGINT"
+        )
         #    |---- substep variable length: positions beyond the barcode end contribute 0
         if not fixed_len:
-            code = "CASE WHEN length(b) > %d THEN %s ELSE 0::UBIGINT END" % (i, code)
-            conf = "CASE WHEN length(b) > %d THEN %s ELSE 0::UBIGINT END" % (i, conf)
-        code_terms.append("(%s)" % code)
-        conf_terms.append("(%s)" % conf)
-    
+            code = (
+                f"CASE WHEN length(b) > {i} "
+                f"THEN {code} "
+                "ELSE 0::UBIGINT END"
+            )
+            conf = (
+                f"CASE WHEN length(b) > {i} "
+                f"THEN {conf} "
+                "ELSE 0::UBIGINT END"
+            )
+        code_terms.append(f"({code})")
+        conf_terms.append(f"({conf})")
+
     # step2 : OR all lane terms together into two 64-bit words
     return (
-        "(%s)::UBIGINT" % " | ".join(code_terms),
-        "(%s)::UBIGINT" % " | ".join(conf_terms)
+        f"({' | '.join(code_terms)})::UBIGINT",
+        f"({' | '.join(conf_terms)})::UBIGINT"
     )
 
 
@@ -95,16 +112,21 @@ def seed_join_parts(src, seed_len, n_seeds, band):
     """
     # with indels (band > 0): probe the child at every shift [-band .. +band] and compare lengths
     if band > 0:
-        from_clause = ("%s c CROSS JOIN range(%d) AS s(slot) CROSS JOIN range(%d, %d) AS h(sh)"
-                       % (src, n_seeds, -band, band + 1))
-        pos = "s.slot * %d + h.sh" % seed_len
-        shift_filter = "AND %s >= 0 AND %s + %d <= length(c.b)" % (pos, pos, seed_len)
-        seed_expr = "hash(substr(c.b, %s + 1, %d))" % (pos, seed_len)
-        length_filter = "AND abs(length(c.b) - length(p.b)) <= %d" % band
+        from_clause = (
+            f"{src} c CROSS JOIN range({n_seeds}) AS s(slot) "
+            f"CROSS JOIN range({-band}, {band + 1}) AS h(sh)"
+        )
+        pos = f"s.slot * {seed_len} + h.sh"
+        shift_filter = (
+            f"AND {pos} >= 0 "
+            f"AND {pos} + {seed_len} <= length(c.b)"
+        )
+        seed_expr = f"hash(substr(c.b, {pos} + 1, {seed_len}))"
+        length_filter = f"AND abs(length(c.b) - length(p.b)) <= {band}"
     # without indels: only the exact slot positions, no shift / length filters
     else:
-        from_clause = "%s c CROSS JOIN range(%d) AS s(slot)" % (src, n_seeds)
-        seed_expr = "hash(substr(c.b, s.slot * %d + 1, %d))" % (seed_len, seed_len)
+        from_clause = f"{src} c CROSS JOIN range({n_seeds}) AS s(slot)"
+        seed_expr = f"hash(substr(c.b, s.slot * {seed_len} + 1, {seed_len}))"
         shift_filter = length_filter = ""
 
     return from_clause, seed_expr, shift_filter, length_filter
@@ -143,9 +165,9 @@ def rank_key_sql(cost_expr, parent_count_expr, tiebreak_expr):
         -- str: SQL expression
     """
     return (
-        "(%s)::HUGEINT * 79228162514264337593543950336 + "
-        "(4294967295 - LEAST(%s, 4294967295))::HUGEINT * 18446744073709551616 + "
-        "(%s)::HUGEINT" % (cost_expr, parent_count_expr, tiebreak_expr)
+        f"({cost_expr})::HUGEINT * 79228162514264337593543950336 + "                                
+        f"(4294967295 - LEAST({parent_count_expr}, 4294967295))::HUGEINT * 18446744073709551616 + " 
+        f"({tiebreak_expr})::HUGEINT"                                                               
     )
 
 
@@ -190,20 +212,30 @@ def matched_query_plain(src, seed_len, n_seeds, ratio, max_dist, band):
     if band > 0:
         dist = "levenshtein(c.b, p.b)"
     else:
-        dist = "CASE WHEN length(c.b) = length(p.b) THEN hamming(c.b, p.b) ELSE 99 END"
-    
+        dist = (
+            "CASE WHEN length(c.b) = length(p.b) "
+            "THEN hamming(c.b, p.b) "
+            "ELSE 99 END"
+        )
+
     # ranking key for arg_min: smaller distance, then larger parent count, then hash
     key = rank_key_sql(dist, "p.n", "hash(p.b)")
 
     # assemble: seed join -> heavy lookup -> coverage / tie rules -> distance filter -> best parent
     return (
-        "SELECT c.b AS barcode, c.n AS n, arg_min(p.hid, %s) AS parent_id FROM %s "
-        "JOIN hseed q ON q.slot = s.slot AND q.seed_hash = %s "
+        "SELECT c.b AS barcode, "
+        "c.n AS n, "
+        f"arg_min(p.hid, {key}) AS parent_id "
+        f"FROM {from_clause} "
+        f"JOIN hseed q ON q.slot = s.slot AND q.seed_hash = {seed} "
         "JOIN heavy p ON p.hid = q.hid "
-        "WHERE p.b <> c.b AND p.n >= %r * c.n "
-        "AND (p.n > c.n OR (p.n = c.n AND p.b < c.b)) %s %s AND (%s) <= %d "
-        "GROUP BY c.b, c.n" % (key, from_clause, seed, float(ratio),
-                               shift_filter, length_filter, dist, max_dist)
+        "WHERE p.b <> c.b "
+        f"AND p.n >= {float(ratio)!r} * c.n "
+        "AND (p.n > c.n OR (p.n = c.n AND p.b < c.b)) "
+        f"{shift_filter} "
+        f"{length_filter} "
+        f"AND ({dist}) <= {max_dist} "
+        "GROUP BY c.b, c.n"
     )
 
 
@@ -249,8 +281,10 @@ def matched_query_quality(src, seed_len, n_seeds, ratio, max_hard, max_low, band
     xor_expr = "xor(c.code, p.code)"
 
     hard_expr = (
-        "bit_count((((%s) | ((%s) >> 1::UBIGINT)) & c.conf & p.conf)::BIGINT)"
-        % (xor_expr, xor_expr)
+        "bit_count(("
+        f"(({xor_expr}) | (({xor_expr}) >> 1::UBIGINT))"    # mismatching bases (either lane bit differs)
+        " & c.conf & p.conf"                                # ... where both bases are confident
+        ")::BIGINT)"
     )
 
     lev_col = ", levenshtein(c.b, p.b) AS lev" if band > 0 else ""
@@ -261,19 +295,22 @@ def matched_query_quality(src, seed_len, n_seeds, ratio, max_hard, max_low, band
     #   - Meet the minimum parent-to-child read-count ratio.
     #   - Follow the abundance-based ordering used to avoid duplicate child-parent comparisons.
     layer_a = (
-        "SELECT c.b AS barcode, c.n AS n, p.hid AS parent_id, p.n AS parent_n, "
+        "SELECT c.b AS barcode, "
+        "c.n AS n, "
+        "p.hid AS parent_id, "
+        "p.n AS parent_n, "
         "hash(p.b) AS parent_hash, "
-        "CASE WHEN %s THEN hamming(c.b, p.b) END AS total, "
-        "CASE WHEN %s THEN %s END AS hard%s "
-        "FROM %s JOIN hseed q ON q.slot = s.slot AND q.seed_hash = %s "
+        f"CASE WHEN {same_len} THEN hamming(c.b, p.b) END AS total, "
+        f"CASE WHEN {same_len} THEN {hard_expr} END AS hard"
+        f"{lev_col} "
+        f"FROM {from_clause} "
+        f"JOIN hseed q ON q.slot = s.slot AND q.seed_hash = {seed} "
         "JOIN heavy p ON p.hid = q.hid "
-        "WHERE p.b <> c.b AND p.n >= %r * c.n "
-        "AND (p.n > c.n OR (p.n = c.n AND p.b < c.b)) %s %s"
-        % (
-            same_len, same_len, hard_expr, lev_col,
-            from_clause, seed, float(ratio),
-            shift_filter, length_filter
-        )
+        "WHERE p.b <> c.b "
+        f"AND p.n >= {float(ratio)!r} * c.n "
+        "AND (p.n > c.n OR (p.n = c.n AND p.b < c.b)) "
+        f"{shift_filter} "
+        f"{length_filter}"
     )
 
     # Step 4: Evaluate candidate pairs using two independent matching criteria.
@@ -283,20 +320,25 @@ def matched_query_quality(src, seed_len, n_seeds, ratio, max_hard, max_low, band
     # Levenshtein cost:
     #   Accept pairs whose edit distance is within max_hard.
     ham_cost = (
-        "CASE WHEN total IS NOT NULL AND hard <= %d AND total - hard <= %d "
-        "THEN hard * %d + (total - hard) END"
-        % (max_hard, max_low, COST_SCALE)
+        "CASE WHEN total IS NOT NULL "
+        f"AND hard <= {max_hard} "
+        f"AND total - hard <= {max_low} "
+        f"THEN hard * {COST_SCALE} + (total - hard) END"
     )
 
-    lev_cost = (
-        "CASE WHEN lev <= %d THEN lev * %d END" % (max_hard, COST_SCALE)
-        if band > 0 else "NULL"
-    )
+    if band > 0:
+        lev_cost = (
+            f"CASE WHEN lev <= {max_hard} "
+            f"THEN lev * {COST_SCALE} END"
+        )
+    else:
+        lev_cost = "NULL"
 
     layer_b = (
         "SELECT barcode, n, parent_id, parent_n, parent_hash, "
-        "%s AS ham_cost, %s AS lev_cost FROM (%s)"
-        % (ham_cost, lev_cost, layer_a)
+        f"{ham_cost} AS ham_cost, "
+        f"{lev_cost} AS lev_cost "
+        f"FROM ({layer_a})"
     )
 
     # Step 5: Select the best accepted parent for each child barcode.
@@ -312,9 +354,12 @@ def matched_query_quality(src, seed_len, n_seeds, ratio, max_hard, max_low, band
     key = rank_key_sql(best_cost, "parent_n", "parent_hash")
 
     return (
-        "SELECT barcode, n, arg_min(parent_id, %s) AS parent_id FROM (%s) "
-        "WHERE ham_cost IS NOT NULL OR lev_cost IS NOT NULL GROUP BY barcode, n"
-        % (key, layer_b)
+        "SELECT barcode, "
+        "n, "
+        f"arg_min(parent_id, {key}) AS parent_id "
+        f"FROM ({layer_b}) "
+        "WHERE ham_cost IS NOT NULL OR lev_cost IS NOT NULL "
+        "GROUP BY barcode, n"
     )
 
 
@@ -351,83 +396,96 @@ def pin_join_order(con, enabled):
     try:
         con.execute("SET disabled_optimizers='join_order'" if enabled else "RESET disabled_optimizers")
     except Exception as e:
-        log_sub("NOTE: could not %s join-order pinning (%s)" % ("enable" if enabled else "reset", str(e).splitlines()[0]))
+        action = "enable" if enabled else "reset"
+        log_sub(f"NOTE: could not {action} join-order pinning ({str(e).splitlines()[0]})")
 
 
 def dump_plan(con, query, path):
     """
     Write DuckDB's EXPLAIN of a query to a text file (to inspect the join order / build side).
     Parameters:
-            -- con: duckdb connection
-            -- query: str: SQL query to explain
-            -- path: str: text file to write
+        -- con: duckdb connection
+        -- query: str: SQL query to explain
+        -- path: str: text file to write
     Returns:
-            -- None: nothing (a failure only prints a note)
+        -- None: nothing (a failure only prints a note)
     """
     try:
         rows = con.execute("EXPLAIN " + query).fetchall()
         with open(path, "w") as fo:
             for row in rows:
                 fo.write(str(row[-1]) + "\n")
-        log_sub("query plan written to %s" % path)
+        log_sub(f"query plan written to {path}")
     except Exception as e:
-        log_sub("NOTE: could not write the query plan (%s)" % str(e).splitlines()[0])
+        log_sub(f"NOTE: could not write the query plan ({str(e).splitlines()[0]})")
 
 
-# ---- stage driver -----------------------------------------------------
+# ---- Stage processing -----------------------------------------------------
 
 def stage_barcodes(args, work, threads, mem_gb):
     """
-    S2: barcode census -> centre barcode for every barcode  (<work>/bcmap.parquet).
-    Parents are barcodes with count >= --barcode_ratio (the 'heavy' set).  Every barcode is matched
-    to heavy parents by seed join + quality-aware Hamming (or Levenshtein for indels); best parent =
-    smallest (hard, low) distance, then largest count; chains are resolved by pointer jumping on the
-    heavy set only.  Also writes <out>.meta/raw_stats.json, <out>.meta/barcode_clusters.parquet,
-    the optional <out>.barcode_map.tsv and the marker <work>/bcmap.done.
+    S2: Build barcode clusters by assigning each raw barcode to a centre barcode.
+
+    1. Count reads for each distinct barcode and collect its quality information.
+    2. Identify heavy barcodes, which are eligible to act as cluster parents.
+    3. Match each barcode to its best heavy parent using seed-based matching.
+       Matching uses quality-aware Hamming distance, or Levenshtein distance when indels are enabled.
+    4. Resolve parent chains among heavy barcodes so that every barcode points directly to its final cluster centre.
+    5. Assign light barcodes to the centre of their matched heavy parent.
+       Unmatched light barcodes are retained as their own centres only when they meet the minimum read-count threshold.
+    6. Calculate barcode-cluster statistics and write the output files.
+
     Parameters:
-            -- args: argparse.Namespace: barcode_ratio/dist/max_lowq/indel, min_*_reads, max_cand,
-               barcode_map, out
-            -- work: str: work directory
-            -- threads: int: DuckDB threads
-            -- mem_gb: float: RAM budget in GB (85% is given to DuckDB)
+        -- args: argparse.Namespace
+        -- work: working directory for intermediate and output files
+        -- threads: DuckDB threads
+        -- mem_gb: RAM budget in GB (85% is given to DuckDB)
     Returns:
-            -- None: nothing; results are files
+        -- None: results are files
     """
-    # step1 : file names, tuple source and DuckDB connection
+    # step1: initialise working files and DuckDB
     census_base = work + "/census_base.parquet"
     census_q = work + "/census_q.parquet"
     bcmap = work + "/bcmap.parquet"
-    tuples = "read_parquet(%s)" % sql_str(work + "/tuples/t*.parquet")
+    tuples = f"read_parquet({sql_str(work + '/tuples/t*.parquet')})"
     log("S2: barcode census + clustering (DuckDB, out-of-core) ...")
-    log_sub("DuckDB budget for S2: %.1f GB RAM, %d thread(s); spill directory %s/duck_bc"
-            % (mem_gb * 0.85, threads, work))
-    #      |----   substep DuckDB with 85% of the RAM budget and its own spill directory
+    log_sub(f"DuckDB budget for S2: {mem_gb * 0.85:.1f} GB RAM, {threads} thread(s); "
+            f"spill directory {work}/duck_bc")
     con = open_duckdb(work, threads, mem_gb * 0.85, "bc", work + "/bc.duckdb")
 
-    # step2 : census: reads per distinct barcode + AND of its low-quality masks
-    con.execute("COPY (SELECT barcode AS b, SUM(cnt)::BIGINT AS n, bit_and(bm) AS bm "
-                "FROM %s GROUP BY barcode) TO %s (FORMAT PARQUET, COMPRESSION ZSTD)"
-                % (tuples, sql_str(census_base)))
+    # step2: Build the barcode census.
+    con.execute(
+        "COPY (SELECT barcode AS b, SUM(cnt)::BIGINT AS n, bit_and(bm) AS bm "
+        f"FROM {tuples} "
+        "GROUP BY barcode) "
+        f"TO {sql_str(census_base)} (FORMAT PARQUET, COMPRESSION ZSTD)"
+    )
     #      |----   substep reads, distinct barcodes and the barcode length range
     n_distinct, n_reads, min_len, max_len = con.execute(
-        "SELECT COUNT(*), SUM(n), MIN(length(b)), MAX(length(b)) FROM read_parquet(%s)"
-        % sql_str(census_base)).fetchone()
-    log_sub("%d reads, %d distinct barcodes (length %d-%d)" % (n_reads, n_distinct, min_len, max_len))
+        "SELECT COUNT(*), SUM(n), MIN(length(b)), MAX(length(b)) "
+        f"FROM read_parquet({sql_str(census_base)})"
+    ).fetchone()
+    log_sub(f"{n_reads} reads, {n_distinct} distinct barcodes (length {min_len}-{max_len})")
     #      |----   substep distinct raw target sequences (for the stats file)
-    n_raw_targets = con.execute("SELECT COUNT(*) FROM (SELECT target FROM %s GROUP BY target)"
-                                % tuples).fetchone()[0]
-    log_sub("%d distinct raw target sequences" % n_raw_targets)
+    n_raw_targets = con.execute(
+        "SELECT COUNT(*) "
+        f"FROM (SELECT target FROM {tuples} GROUP BY target)"
+    ).fetchone()[0]
+    log_sub(f"{n_raw_targets} distinct raw target sequences")
     #      |----   substep distinct raw (barcode, target) pairs (for the stats file)
     #      |----   substep one compacted file holds unique (barcode, target) rows: its row count is the answer;
     #      |----   substep several tiers can repeat a pair, so count distinct 128-bit md5 keys of the pair
     tuple_files = glob.glob(work + "/tuples/t*.parquet")
     if len(tuple_files) == 1:
-        n_raw_pairs = con.execute("SELECT COUNT(*) FROM %s" % tuples).fetchone()[0]
+        n_raw_pairs = con.execute(f"SELECT COUNT(*) FROM {tuples}").fetchone()[0]
     else:
         n_raw_pairs = con.execute(
-            "SELECT COUNT(*) FROM (SELECT md5_number(barcode || '|' || target) AS k FROM %s "
-            "GROUP BY k)" % tuples).fetchone()[0]
-    log_sub("%d distinct raw (barcode, target) pairs" % n_raw_pairs)
+            "SELECT COUNT(*) "
+            "FROM (SELECT md5_number(barcode || '|' || target) AS k "
+            f"FROM {tuples} "
+            "GROUP BY k)"
+        ).fetchone()[0]
+    log_sub(f"{n_raw_pairs} distinct raw (barcode, target) pairs")
 
     # step3 : settings: ratio, distances, quality mode and seed layout
     ratio = max(args.barcode_ratio, 1.0)        # parent count >= ratio x child count
@@ -437,18 +495,18 @@ def stage_barcodes(args, work, threads, mem_gb):
     use_quality = args.barcode_max_lowq > 0 and max_len <= MAX_QUAL_BARCODE_LEN
     max_low = args.barcode_max_lowq if use_quality else 0
     if args.barcode_max_lowq > 0 and not use_quality:
-        log_sub("NOTE: barcodes longer than %d bp: quality-aware clustering off for barcodes"
-            % MAX_QUAL_BARCODE_LEN)
+        log_sub(f"NOTE: barcodes longer than {MAX_QUAL_BARCODE_LEN} bp: "
+                "quality-aware clustering off for barcodes")
     #      |----   substep pigeonhole seeds: pairs with <= max_hard+max_low differences share one of (max_hard+max_low+1)
     #      |----   substep seeds exactly; lower max_low while the seeds would get shorter than MIN_SEED_LEN
     while use_quality and max_low > 0 and min_len // (max_hard + max_low + 1) < MIN_SEED_LEN:
         max_low -= 1
-        log_sub("NOTE: barcodes too short for the requested --barcode_max_lowq; using %d" % max_low)
+        log_sub(f"NOTE: barcodes too short for the requested --barcode_max_lowq; using {max_low}")
     #      |----   substep final seed layout
     n_seeds = max_hard + max_low + 1
     seed_len = min_len // n_seeds
     if seed_len < MIN_SEED_LEN:
-        raise SystemExit("ERROR: barcodes too short for --barcode_dist %d" % max_hard)
+        raise SystemExit(f"ERROR: barcodes too short for --barcode_dist {max_hard}")
     #      |----   substep read-count thresholds for dropping light barcodes
     min_barcode_reads = (args.min_barcode_reads if args.min_barcode_reads is not None
                          else args.min_pair_reads)
@@ -459,13 +517,18 @@ def stage_barcodes(args, work, threads, mem_gb):
         # add code / conf words (see packed_barcode_sql); mask bit 1 = low quality
         code_expr, conf_expr = packed_barcode_sql(
             max_len, max_len if min_len == max_len else 0)
-        con.execute("COPY (SELECT b, n, %s AS code, %s AS conf FROM read_parquet(%s)) "
-                    "TO %s (FORMAT PARQUET, COMPRESSION ZSTD)"
-                    % (code_expr, conf_expr, sql_str(census_base), sql_str(census_q)))
+        con.execute(
+            "COPY (SELECT b, "
+            "n, "
+            f"{code_expr} AS code, "
+            f"{conf_expr} AS conf "
+            f"FROM read_parquet({sql_str(census_base)})) "
+            f"TO {sql_str(census_q)} (FORMAT PARQUET, COMPRESSION ZSTD)"
+        )
         census_file = census_q
         columns = "b, n, code, conf"
-        log_sub("quality-aware matching: <= %d hard + <= %d low-quality mismatches, %d seeds of %d bp"
-            % (max_hard, max_low, n_seeds, seed_len))
+        log_sub(f"quality-aware matching: <= {max_hard} hard + <= {max_low} low-quality mismatches, "
+                f"{n_seeds} seeds of {seed_len} bp")
     else:
         census_file = census_base
         columns = "b, n"
@@ -485,58 +548,76 @@ def stage_barcodes(args, work, threads, mem_gb):
         return matched_query_plain(src, seed_len, n_seeds, ratio, max_hard, band)
 
     #      |----   substep census source for the following queries
-    census = "read_parquet(%s)" % sql_str(census_file)
+    census = f"read_parquet({sql_str(census_file)})"
 
     # step5 : heavy barcodes = the only possible parents; build their seed index
     # Every heavy barcode gets an integer id (hid).  All big joins below use ids and 64-bit
     # seed hashes instead of the barcode strings, so the join tables stay small and in memory.
     #      |----   substep heavy table: integer id (hid) + packed barcode columns
-    con.execute("CREATE OR REPLACE TABLE heavy AS SELECT ROW_NUMBER() OVER () AS hid, %s "
-                "FROM %s WHERE n >= %r" % (columns, census, float(ratio)))
+    con.execute(
+        "CREATE OR REPLACE TABLE heavy AS "
+        f"SELECT ROW_NUMBER() OVER () AS hid, {columns} "
+        f"FROM {census} "
+        f"WHERE n >= {float(ratio)!r}"
+    )
     n_heavy = con.execute("SELECT COUNT(*) FROM heavy").fetchone()[0]
-    log_sub("%d heavy barcodes (count >= %g) can be cluster centres/parents" % (n_heavy, ratio))
+    log_sub(f"{n_heavy} heavy barcodes (count >= {ratio:g}) can be cluster centres/parents")
     #      |----   substep seed index of the heavy set: (slot, seed hash, heavy id); seeds shared by more than --max_cand
     #      |----   substep heavy barcodes (low complexity) are dropped to bound the join size
-    con.execute("""
+    con.execute(f"""
         CREATE OR REPLACE TABLE hseed AS
         SELECT hid, slot, seed_hash FROM (
             SELECT h.hid AS hid, s.slot AS slot,
-                   hash(substr(h.b, s.slot * %d + 1, %d)) AS seed_hash
-            FROM heavy h CROSS JOIN range(%d) AS s(slot))
-        QUALIFY count(*) OVER (PARTITION BY slot, seed_hash) <= %d
-    """ % (seed_len, seed_len, n_seeds, args.max_cand))
+                   hash(substr(h.b, s.slot * {seed_len} + 1, {seed_len})) AS seed_hash
+            FROM heavy h CROSS JOIN range({n_seeds}) AS s(slot))
+        QUALIFY count(*) OVER (PARTITION BY slot, seed_hash) <= {args.max_cand}
+    """)
     n_seed_rows = con.execute("SELECT COUNT(*) FROM hseed").fetchone()[0]
-    log_sub("seed index built: %d entries (%d seeds of %d bp per heavy barcode); "
-            "spill so far %.1f GB" % (n_seed_rows, n_seeds, seed_len, spill_gb(work)))
+    log_sub(f"seed index built: {n_seed_rows} entries "
+            f"({n_seeds} seeds of {seed_len} bp per heavy barcode); "
+            f"spill so far {spill_gb(work):.1f} GB")
 
     # step6 : heavy barcodes: best heavy parent, then pointer jumping to the root
     #      |----   substep pin the join order: children JOIN integer seed index JOIN heavy strings
     pin_join_order(con, True)
     #      |----   substep best heavy parent of every heavy barcode (hroot: hid -> root_id)
-    con.execute("CREATE OR REPLACE TABLE hroot AS "
-                "SELECT h.hid AS hid, COALESCE(m.parent_id, h.hid) AS root_id "
-                "FROM heavy h LEFT JOIN (%s) m ON m.barcode = h.b" % matched("heavy"))
+    con.execute(
+        "CREATE OR REPLACE TABLE hroot AS "
+        "SELECT h.hid AS hid, COALESCE(m.parent_id, h.hid) AS root_id "
+        "FROM heavy h "
+        f"LEFT JOIN ({matched('heavy')}) m ON m.barcode = h.b"
+    )
     n_with_parent = con.execute("SELECT COUNT(*) FROM hroot WHERE root_id <> hid").fetchone()[0]
-    log_sub("%d of %d heavy barcodes have a more abundant heavy parent; spill so far %.1f GB"
-            % (n_with_parent, n_heavy, spill_gb(work)))
+    log_sub(f"{n_with_parent} of {n_heavy} heavy barcodes have a more abundant heavy parent; "
+            f"spill so far {spill_gb(work):.1f} GB")
     #      |----   substep pointer jumping: root := root of root, until nothing changes
     jump_round = 0
     while True:                                 # root := root of root, until nothing changes
         jump_round += 1
-        con.execute("CREATE OR REPLACE TABLE hroot2 AS "
-                    "SELECT a.hid AS hid, COALESCE(b.root_id, a.root_id) AS root_id "
-                    "FROM hroot a LEFT JOIN hroot b ON a.root_id = b.hid")
-        n_changed = con.execute("SELECT COUNT(*) FROM hroot a JOIN hroot2 b USING (hid) "
-                                "WHERE a.root_id <> b.root_id").fetchone()[0]
+        con.execute(
+            "CREATE OR REPLACE TABLE hroot2 AS "
+            "SELECT a.hid AS hid, COALESCE(b.root_id, a.root_id) AS root_id "
+            "FROM hroot a "
+            "LEFT JOIN hroot b ON a.root_id = b.hid"
+        )
+        n_changed = con.execute(
+            "SELECT COUNT(*) "
+            "FROM hroot a "
+            "JOIN hroot2 b USING (hid) "
+            "WHERE a.root_id <> b.root_id"
+        ).fetchone()[0]
         con.execute("DROP TABLE hroot")
         con.execute("ALTER TABLE hroot2 RENAME TO hroot")
-        log_sub("pointer jumping round %d: %d heavy barcodes changed root" % (jump_round, n_changed))
+        log_sub(f"pointer jumping round {jump_round}: {n_changed} heavy barcodes changed root")
         if not n_changed:
             break
     #      |----   substep centre barcode (string) of every heavy barcode (hcentre)
-    con.execute("CREATE OR REPLACE TABLE hcentre AS "
-                "SELECT r.hid AS hid, r.root_id AS root_id, c.b AS centre "
-                "FROM hroot r JOIN heavy c ON c.hid = r.root_id")
+    con.execute(
+        "CREATE OR REPLACE TABLE hcentre AS "
+        "SELECT r.hid AS hid, r.root_id AS root_id, c.b AS centre "
+        "FROM hroot r "
+        "JOIN heavy c ON c.hid = r.root_id"
+    )
 
     # step7 : every barcode -> centre barcode (writes bcmap.parquet)
     #  heavy barcode            -> its root
@@ -545,49 +626,58 @@ def stage_barcodes(args, work, threads, mem_gb):
     # The expensive light-barcode join runs ONCE (table lmatch); later steps reuse it.
     # Light barcodes below --min_child_reads are ignored completely (not matched, not kept).
     #      |----   substep children = light barcodes (n < ratio and n >= --min_child_reads)
-    children = "(SELECT %s FROM %s WHERE n < %r AND n >= %d)" % (columns, census, float(ratio),
-                                                                  min_child_reads)
+    children = (
+        f"(SELECT {columns} "
+        f"FROM {census} "
+        f"WHERE n < {float(ratio)!r} "
+        f"AND n >= {min_child_reads})"
+    )
     #      |----   substep save the query plan to check the join order
     dump_plan(con, matched(children), work + "/explain_light_match.txt")
     log_sub("matching light barcodes to heavy parents (the longest step) ...")
     #      |----   substep match light barcodes to heavy parents (expensive join; run once, reused below)
-    con.execute("CREATE OR REPLACE TABLE lmatch AS "
-                "SELECT barcode, n, parent_id, hash(barcode) AS hk FROM (%s)" % matched(children))
+    con.execute(
+        "CREATE OR REPLACE TABLE lmatch AS "
+        "SELECT barcode, n, parent_id, hash(barcode) AS hk "
+        f"FROM ({matched(children)})"
+    )
     #      |----   substep release the join-order pin
     pin_join_order(con, False)
     n_lmatch = con.execute("SELECT COUNT(*) FROM lmatch").fetchone()[0]
-    log_sub("%d light barcodes matched to a heavy parent; spill so far %.1f GB"
-            % (n_lmatch, spill_gb(work)))
+    log_sub(f"{n_lmatch} light barcodes matched to a heavy parent; "
+            f"spill so far {spill_gb(work):.1f} GB")
     #      |----   substep light barcodes without a parent keep their own centre when they have enough reads
     #      |----   substep (anti-join on the 64-bit barcode hash: no strings in the join table)
-    con.execute("""
+    con.execute(f"""
         CREATE OR REPLACE TABLE lown AS
-        SELECT s.b AS b, s.n AS n FROM %s s
-        WHERE s.n >= %d AND s.n < %r
+        SELECT s.b AS b, s.n AS n FROM {census} s
+        WHERE s.n >= {max(min_barcode_reads, min_child_reads)} AND s.n < {float(ratio)!r}
           AND NOT EXISTS (SELECT 1 FROM lmatch m WHERE m.hk = hash(s.b))
-    """ % (census, max(min_barcode_reads, min_child_reads), float(ratio)))
+    """)
     n_lown = con.execute("SELECT COUNT(*) FROM lown").fetchone()[0]
-    log_sub("%d light barcodes without a parent kept as their own cluster" % n_lown)
+    log_sub(f"{n_lown} light barcodes without a parent kept as their own cluster")
     #      |----   substep bcmap.parquet = heavy -> root | light with parent -> root of parent | light own centre
-    con.execute("""
+    con.execute(f"""
         COPY (
-            SELECT h.b AS barcode, c.centre AS centre, h.n AS n         -- heavy barcodes
+            SELECT h.b AS barcode, c.centre AS centre, h.n AS n
             FROM heavy h JOIN hcentre c ON c.hid = h.hid
             UNION ALL
-            SELECT m.barcode, c.centre, m.n                              -- light, has a parent
+            SELECT m.barcode, c.centre, m.n                             
             FROM lmatch m JOIN hcentre c ON c.hid = m.parent_id
             UNION ALL
-            SELECT b, b, n FROM lown                                     -- light, own centre
-        ) TO %s (FORMAT PARQUET, COMPRESSION ZSTD)
-    """ % sql_str(bcmap))
+            SELECT b, b, n FROM lown                                     
+        ) TO {sql_str(bcmap)} (FORMAT PARQUET, COMPRESSION ZSTD)
+    """)
     #      |----   substep report mapped / dropped barcodes
     n_mapped, n_centres, n_mapped_reads = con.execute(
-        "SELECT COUNT(*), COUNT(*) FILTER (WHERE barcode = centre), SUM(n) FROM read_parquet(%s)"
-        % sql_str(bcmap)).fetchone()
-    log_sub("%d distinct barcodes -> %d barcode clusters; dropped %d barcodes (%d reads) "
-            "(unmatched with < %d reads, or < %d reads = --min_child_reads)"
-            % (n_mapped, n_centres, n_distinct - n_mapped, n_reads - (n_mapped_reads or 0),
-               min_barcode_reads, min_child_reads))
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE barcode = centre), SUM(n) "
+        f"FROM read_parquet({sql_str(bcmap)})"
+    ).fetchone()
+    n_dropped_reads = n_reads - (n_mapped_reads or 0)
+    log_sub(f"{n_mapped} distinct barcodes -> {n_centres} barcode clusters; "
+            f"dropped {n_distinct - n_mapped} barcodes ({n_dropped_reads} reads) "
+            f"(unmatched with < {min_barcode_reads} reads, "
+            f"or < {min_child_reads} reads = --min_child_reads)")
     #      |----   substep save the raw counts and the reads kept by the clustering for S5 (raw_stats.json)
     os.makedirs(meta_path(args), exist_ok=True)
     with open(meta_path(args, "raw_stats.json"), "w") as fo:
@@ -603,7 +693,8 @@ def stage_barcodes(args, work, threads, mem_gb):
     # largest counts by max(n, 2), no window sort); light barcodes that are their own centre are
     # clusters of size 1.
     #      |----   substep meta/barcode_clusters.parquet: count, n_cluster, first_cov, second_cov per centre
-    con.execute("""
+    clusters_out = sql_str(meta_path(args, "barcode_clusters.parquet"))
+    con.execute(f"""
         COPY (
             SELECT c.b AS barcode, g."count" AS "count", g.n_cluster AS n_cluster,
                    g.first_cov AS first_cov, g.second_cov AS second_cov
@@ -619,14 +710,17 @@ def stage_barcodes(args, work, threads, mem_gb):
             JOIN heavy c ON c.hid = g.root_id
             UNION ALL
             SELECT b, n::BIGINT, 1::BIGINT, n::BIGINT, 0::BIGINT FROM lown
-        ) TO %s (FORMAT PARQUET, COMPRESSION ZSTD)
-    """ % sql_str(meta_path(args, "barcode_clusters.parquet")))
+        ) TO {clusters_out} (FORMAT PARQUET, COMPRESSION ZSTD)
+    """)
     log_sub("barcode cluster statistics written")
     #      |----   substep optional barcode -> centre table (--barcode_map)
     if args.barcode_map:
-        con.execute("COPY (SELECT barcode, n AS reads, centre AS centre_barcode "
-                    "FROM read_parquet(%s)) TO %s (DELIMITER '\t', HEADER)"
-                    % (sql_str(bcmap), sql_str(args.out + ".barcode_map.tsv")))
+        map_out = sql_str(args.out + ".barcode_map.tsv")
+        con.execute(
+            "COPY (SELECT barcode, n AS reads, centre AS centre_barcode "
+            f"FROM read_parquet({sql_str(bcmap)})) "
+            f"TO {map_out} (DELIMITER '\t', HEADER)"
+        )
     con.close()
 
     # step9 : clean up and write the --resume marker

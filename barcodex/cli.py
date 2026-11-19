@@ -34,19 +34,19 @@ def add_extraction_options(group, role):
     Returns:
             -- None: nothing
     """
-    group.add_argument("--%s_start" % role, type=int, default=0,
+    group.add_argument(f"--{role}_start", type=int, default=0,
                        help="method pos: 0-based start")
-    group.add_argument("--%s_len" % role, type=int, default=0,
+    group.add_argument(f"--{role}_len", type=int, default=0,
                        help="method pos: length (0 = to the end of the read)")
-    group.add_argument("--%s_up" % role, default=None,
+    group.add_argument(f"--{role}_up", default=None,
                        help="method flank: upstream flanking sequence")
-    group.add_argument("--%s_down" % role, default=None,
+    group.add_argument(f"--{role}_down", default=None,
                        help="method flank: downstream flanking sequence")
-    group.add_argument("--%s_min_len" % role, type=int, default=0,
-                       help="reject %ss shorter than this (0 = off)" % role)
-    group.add_argument("--%s_allowed_lens" % role, default=None,
-                       help="keep only %ss of these lengths, e.g. '19,20,21' or '18-22' "
-                            "(any method; recommended with flank)" % role)
+    group.add_argument(f"--{role}_min_len", type=int, default=0,
+                       help=f"reject {role}s shorter than this (0 = off)")
+    group.add_argument(f"--{role}_allowed_lens", default=None,
+                       help=f"keep only {role}s of these lengths, e.g. '19,20,21' or '18-22' "
+                            "(any method; recommended with flank)")
 
 
 def parse_args(argv=None):
@@ -211,14 +211,14 @@ def validate_args(args):
         errors.append("--barcode_read and --target_read need the same number of files")
     if not args.method:
         errors.append("--method is required, e.g. --method flank none "
-                      "(barcode method, target method; each one of %s)" % ", ".join(METHODS))
+                      f"(barcode method, target method; each one of {', '.join(METHODS)})")
     # step2 : extraction options of both roles
     for role in ("barcode", "target"):
         try:
             max_len = MAX_TARGET_LEN if role == "target" else 0
             errors += validate_spec(spec_from_args(args, role, True, max_len))
         except ValueError as e:
-            errors.append("--%s_allowed_lens: %s" % (role, e))
+            errors.append(f"--{role}_allowed_lens: {e}")
     if args.min_purity_reads < 1:
         errors.append("--min_purity_reads must be >= 1")
     if errors:
@@ -277,9 +277,9 @@ def write_cmd_log(args, argv):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, CMD_LOG)
     with open(path, "a") as fo:
-        fo.write("# %s  barcodex %s  host %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                                 __version__, socket.gethostname()))
-        fo.write("cd %s\n%s\n\n" % (shlex.quote(os.getcwd()), command_text(argv)))
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        fo.write(f"# {stamp}  barcodex {__version__}  host {socket.gethostname()}\n")
+        fo.write(f"cd {shlex.quote(os.getcwd())}\n{command_text(argv)}\n\n")
     return path
 
 
@@ -303,12 +303,12 @@ def main(argv=None):
     threads = max(1, args.threads)
     # step2 : --resolve_only: S5 only
     if args.resolve_only:
-        log("command written to %s" % write_cmd_log(args, argv))
+        log(f"command written to {write_cmd_log(args, argv)}")
         from .resolve import resolve_pairs
         resolve_pairs(args, threads)
         return
     # step3 : validate the options, record the command, then run S1 -> S5
     validate_args(args)
-    log("command written to %s" % write_cmd_log(args, argv))
+    log(f"command written to {write_cmd_log(args, argv)}")
     from .steps import run_steps
     run_steps(args, threads)

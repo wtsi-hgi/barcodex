@@ -90,8 +90,8 @@ def write_synthetic_fastq(tmp_dir, scenario, rnd, n_barcodes=300, barcode_len=16
                     tg_seq, tg_qual = tg_seq + random_seq(20), tg_qual + "I" * 20
                 else:
                     bc_seq, bc_qual = bc_seq + random_seq(30), bc_qual + "I" * 30
-                f_barcode.write("@r%d\n%s\n+\n%s\n" % (read_no, bc_seq, bc_qual))
-                f_target.write("@r%d\n%s\n+\n%s\n" % (read_no, tg_seq, tg_qual))
+                f_barcode.write(f"@r{read_no}\n{bc_seq}\n+\n{bc_qual}\n")
+                f_target.write(f"@r{read_no}\n{tg_seq}\n+\n{tg_qual}\n")
     return truth, barcode_fq, target_fq, n_no_flank
 
 
@@ -122,7 +122,7 @@ def run_scenario(scenario, seed=7):
     from .cli import main
     # step1 : synthetic data
     rnd = random.Random(seed)
-    tmp_dir = tempfile.mkdtemp(prefix="barcodex_selftest_%s_" % scenario)
+    tmp_dir = tempfile.mkdtemp(prefix=f"barcodex_selftest_{scenario}_")
     barcode_len, target_len = 16, 60
     truth, barcode_fq, target_fq, n_no_flank = write_synthetic_fastq(
         tmp_dir, scenario, rnd, barcode_len=barcode_len, target_len=target_len)
@@ -147,8 +147,8 @@ def run_scenario(scenario, seed=7):
     n_ok = sum(1 for bc, tg in truth.items() if got.get(bc) == tg)
     n_wrong = sum(1 for bc, tg in got.items() if bc in truth and truth[bc] != tg)
     n_extra = sum(1 for bc in got if bc not in truth)
-    log("SELFTEST %s: %d/%d true barcodes mapped correctly, %d wrong, %d spurious barcodes"
-        % (scenario, n_ok, len(truth), n_wrong, n_extra))
+    log(f"SELFTEST {scenario}: {n_ok}/{len(truth)} true barcodes mapped correctly, "
+        f"{n_wrong} wrong, {n_extra} spurious barcodes")
     # step4 : the read funnel must add up
     stats = read_stats(out + ".stats.tsv")
     with open(out + ".meta/ingest_stats.json") as fh:
@@ -163,11 +163,13 @@ def run_scenario(scenario, seed=7):
     if scenario == "flank":
         # a random replacement flank can still match within 2 mismatches, hence <=
         funnel_ok = funnel_ok and int(stats["reads_barcode_upstream_not_found"]) <= n_no_flank
-    log("SELFTEST %s: read funnel %s" % (scenario, "adds up" if funnel_ok else "does NOT add up"))
+    funnel_text = "adds up" if funnel_ok else "does NOT add up"
+    log(f"SELFTEST {scenario}: read funnel {funnel_text}")
     # step5 : PASS rule
     passed = (n_ok >= 0.97 * len(truth) and n_wrong == 0 and n_extra <= 0.02 * len(truth)
               and funnel_ok)
-    log("SELFTEST %s %s   (files in %s)" % (scenario, "PASS" if passed else "FAIL", tmp_dir))
+    verdict = "PASS" if passed else "FAIL"
+    log(f"SELFTEST {scenario} {verdict}   (files in {tmp_dir})")
     return passed
 
 

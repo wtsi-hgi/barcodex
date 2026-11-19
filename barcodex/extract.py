@@ -98,7 +98,7 @@ def parse_allowed_lens(text):
         else:
             lengths.add(int(item))
     if any(x <= 0 for x in lengths):
-        raise ValueError("lengths must be positive: %r" % text)
+        raise ValueError(f"lengths must be positive: {text!r}")
     return frozenset(lengths)
 
 
@@ -122,7 +122,7 @@ def spec_from_args(args, role, require_full_len, max_len=0):
         Returns:
                 -- object: option value
         """
-        return getattr(args, "%s_%s" % (role, name), default)
+        return getattr(args, f"{role}_{name}", default)
     method = args.method[0 if role == "barcode" else 1] if args.method else "none"
     return ExtractSpec(role=role, method=method, start=opt("start"), length=opt("len"),
                        require_full_len=require_full_len,
@@ -148,49 +148,47 @@ def validate_spec(spec):
     role = spec.role
     # step1 : method and the options that belong to it
     if spec.method not in METHODS:
-        errors.append("%s method must be one of %s" % (role, ", ".join(METHODS)))
+        errors.append(f"{role} method must be one of {', '.join(METHODS)}")
     if spec.method != "pos" and (spec.start or spec.length):
-        errors.append("--%s_start / --%s_len need the %s method pos" % (role, role, role))
+        errors.append(f"--{role}_start / --{role}_len need the {role} method pos")
     if spec.method != "flank" and (spec.up or spec.down):
-        errors.append("--%s_up / --%s_down need the %s method flank" % (role, role, role))
+        errors.append(f"--{role}_up / --{role}_down need the {role} method flank")
     if spec.method == "flank" and not (spec.up and spec.down):
-        errors.append("%s method flank needs --%s_up and --%s_down" % (role, role, role))
+        errors.append(f"{role} method flank needs --{role}_up and --{role}_down")
     # step2 : numbers and flanks
-    for name, value in (("--%s_start" % role, spec.start), ("--%s_len" % role, spec.length),
+    for name, value in ((f"--{role}_start", spec.start), (f"--{role}_len", spec.length),
                         ("--flank_mismatch", spec.flank_mismatch),
-                        ("--%s_min_len" % role, spec.min_len),
-                        ("--%s_temp_mismatch" % role, spec.template_mismatch)):
+                        (f"--{role}_min_len", spec.min_len),
+                        (f"--{role}_temp_mismatch", spec.template_mismatch)):
         if value < 0:
-            errors.append("%s must be >= 0" % name)
+            errors.append(f"{name} must be >= 0")
     for name, flank in (("up", spec.up), ("down", spec.down)):
         if flank and set(flank) - TEMPLATE_BASES:
-            errors.append("--%s_%s may only contain A, C, G, T, N" % (role, name))
+            errors.append(f"--{role}_{name} may only contain A, C, G, T, N")
         if flank and spec.flank_mismatch >= len(flank):
-            errors.append("--flank_mismatch must be smaller than the length of --%s_%s"
-                          % (role, name))
+            errors.append(f"--flank_mismatch must be smaller than the length of --{role}_{name}")
     # step3 : length filters must leave something to keep
     if spec.max_len and spec.min_len > spec.max_len:
-        errors.append("--%s_min_len is longer than the %d bp limit" % (role, spec.max_len))
+        errors.append(f"--{role}_min_len is longer than the {spec.max_len} bp limit")
     if spec.allowed_lens and spec.min_len and max(spec.allowed_lens) < spec.min_len:
-        errors.append("--%s_allowed_lens and --%s_min_len exclude every length" % (role, role))
+        errors.append(f"--{role}_allowed_lens and --{role}_min_len exclude every length")
     # step4 : template: A/C/G/T/N only, its length must pass the length filters
     if spec.template:
         n_template = len(spec.template)
         if set(spec.template) - TEMPLATE_BASES:
-            errors.append("--%s_temp may only contain A, C, G, T, N" % role)
+            errors.append(f"--{role}_temp may only contain A, C, G, T, N")
         if "N" not in spec.template:
-            errors.append("--%s_temp has no N (no variable position)" % role)
+            errors.append(f"--{role}_temp has no N (no variable position)")
         if spec.template_mismatch >= n_template - spec.template.count("N") > 0:
-            errors.append("--%s_temp_mismatch must be smaller than the number of fixed bases "
-                          "of --%s_temp" % (role, role))
+            errors.append(f"--{role}_temp_mismatch must be smaller than the number of fixed bases "
+                          f"of --{role}_temp")
         if spec.allowed_lens and n_template not in spec.allowed_lens:
-            errors.append("--%s_allowed_lens excludes the --%s_temp length (%d)"
-                          % (role, role, n_template))
+            errors.append(f"--{role}_allowed_lens excludes the --{role}_temp length ({n_template})")
         if spec.min_len > n_template:
-            errors.append("--%s_min_len is longer than --%s_temp (%d)" % (role, role, n_template))
+            errors.append(f"--{role}_min_len is longer than --{role}_temp ({n_template})")
         if spec.method == "pos" and spec.length and spec.length != n_template:
-            errors.append("--%s_len (%d) differs from the --%s_temp length (%d)"
-                          % (role, spec.length, role, n_template))
+            errors.append(f"--{role}_len ({spec.length}) "
+                          f"differs from the --{role}_temp length ({n_template})")
     return errors
 
 
@@ -234,26 +232,22 @@ def reject_reasons(spec, stage):
     reasons = []
     if stage == "extract":
         if spec.method == "flank":
-            reasons.append(("upstream_not_found", "upstream flank (--%s_up) not found" % role))
+            reasons.append(("upstream_not_found", f"upstream flank (--{role}_up) not found"))
             reasons.append(("downstream_not_found",
-                            "downstream flank (--%s_down) not found after the upstream flank"
-                            % role))
+                            f"downstream flank (--{role}_down) not found after the upstream flank"))
         if spec.method == "pos" and spec.require_full_len and spec.length:
-            reasons.append(("too_short", "read shorter than --%s_start + --%s_len" % (role, role)))
-        reasons.append(("empty", "empty %s (read too short, or flanks adjacent)" % role))
+            reasons.append(("too_short", f"read shorter than --{role}_start + --{role}_len"))
+        reasons.append(("empty", f"empty {role} (read too short, or flanks adjacent)"))
     else:
         if spec.max_len:
-            reasons.append(("too_long", "%s longer than %d bp" % (role, spec.max_len)))
+            reasons.append(("too_long", f"{role} longer than {spec.max_len} bp"))
         if spec.min_len:
-            reasons.append(("below_min_len", "%s shorter than --%s_min_len %d"
-                            % (role, role, spec.min_len)))
+            reasons.append(("below_min_len", f"{role} shorter than --{role}_min_len {spec.min_len}"))
         if spec.allowed_lens:
-            reasons.append(("length_filtered", "%s length not in --%s_allowed_lens"
-                            % (role, role)))
+            reasons.append(("length_filtered", f"{role} length not in --{role}_allowed_lens"))
         if spec.template:
-            reasons.append(("template_mismatch", "%s does not match --%s_temp %s"
-                            % (role, role, spec.template)))
-    return [("%s_%s" % (role, key), "read pairs rejected: " + text) for key, text in reasons]
+            reasons.append(("template_mismatch", f"{role} does not match --{role}_temp {spec.template}"))
+    return [(f"{role}_{key}", f"read pairs rejected: {text}") for key, text in reasons]
 
 
 def reject_reason_order(barcode_spec, target_spec):
