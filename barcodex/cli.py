@@ -1,9 +1,6 @@
 """
-Command line: options, validation, the command log and the entry point main().
-
-NAMING CONVENTION
-  Every command-line option is a long snake_case option (--max_reads, --barcode_len, ...),
-  identical to the variable name used in the code (args.max_reads).  There are no short options.
+Command line: 
+options, validation, the command log and the entry point main().
 """
 
 import argparse
@@ -18,178 +15,113 @@ from .common import default_mem_gb, default_threads, log
 from .constants import MAX_TARGET_LEN
 from .extract import METHODS, spec_from_args, validate_spec
 
-# file (in the output directory) that collects the command of every run
+# file that collects the command of every run
 CMD_LOG = "cmd.log"
-
 
 # ---- options ---------------------------------------------------------------
 
 def add_extraction_options(group, role):
     """
-    Add the extraction options of one role (--<role>_start, _len, _up, _down, _min_len,
-    _allowed_lens).  Barcode and target get the same set.
+    Add options for extracting sequences
     Parameters:
-            -- group: argparse argument group
-            -- role: str: 'barcode' or 'target'
+        -- group: argparse argument group
+        -- role: str: 'barcode' or 'target'
     Returns:
-            -- None: nothing
+        -- None: nothing
     """
-    group.add_argument(f"--{role}_start", type=int, default=0,
-                       help="method pos: 0-based start")
-    group.add_argument(f"--{role}_len", type=int, default=0,
-                       help="method pos: length (0 = to the end of the read)")
-    group.add_argument(f"--{role}_up", default=None,
-                       help="method flank: upstream flanking sequence")
-    group.add_argument(f"--{role}_down", default=None,
-                       help="method flank: downstream flanking sequence")
-    group.add_argument(f"--{role}_min_len", type=int, default=0,
-                       help=f"reject {role}s shorter than this (0 = off)")
-    group.add_argument(f"--{role}_allowed_lens", default=None,
-                       help=f"keep only {role}s of these lengths, e.g. '19,20,21' or '18-22' "
-                            "(any method; recommended with flank)")
+    group.add_argument(f"--{role}_start",        type = int, default = 0,    help = "method pos: 0-based start")
+    group.add_argument(f"--{role}_len",          type = int, default = 0,    help = "method pos: length (0 = to the end of the read)")
+    group.add_argument(f"--{role}_up",           type = str, default = None, help = "method flank: upstream flanking sequence")
+    group.add_argument(f"--{role}_down",         type = str, default = None, help = "method flank: downstream flanking sequence")
+    group.add_argument(f"--{role}_min_len",      type = int, default = 0,    help = f"reject {role}s shorter than this (0 = off)")
+    group.add_argument(f"--{role}_allowed_lens", type = str, default = None, help = f"keep only {role}s of lengths, e.g. '19,20,21'")
 
 
-def parse_args(argv=None):
+def parse_args(argv = None):
     """
-    Define and parse the command line.  All options are long snake_case options: the
-    command-line name equals the variable name used in the code (--max_reads -> args.max_reads).
+    Define and parse the command line
     Parameters:
-            -- argv: list[str] or None: argument list (None = sys.argv[1:])
+        -- argv: list[str] or None: argument list (None = sys.argv[1:])
     Returns:
-            -- argparse.Namespace: parsed options
+        -- argparse.Namespace: parsed options
     """
-    # step1 : create the parser
     ap = argparse.ArgumentParser(
-        prog="barcodex",
-        description="Out-of-core, quality-aware barcode -> target association for huge "
-                    "paired-end datasets with one-target-per-barcode resolution.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    # step2 : input FASTQ files, output prefix and the extraction methods
-    ap.add_argument("--barcode_read", nargs="+",
-                    help="FASTQ(.gz) holding the barcode (R1 or R2, one or more files)")
-    ap.add_argument("--target_read", nargs="+",
-                    help="FASTQ(.gz) holding the target sequence, same order")
-    ap.add_argument("--out", help="output prefix")
-    ap.add_argument("--method", nargs=2, choices=METHODS, metavar=("BARCODE", "TARGET"),
-                    help="REQUIRED: how the barcode and the target are taken from their reads, "
-                         "chosen independently: none = the whole read; pos = by position "
-                         "(--*_start, --*_len); flank = between flanking sequences (--*_up, "
-                         "--*_down). Example: --method flank none")
-    ap.add_argument("--flank_mismatch", type=int, default=2,
-                    help="method flank: max edits (substitutions and indels) in each flanking "
-                         "sequence, barcode and target. An exact flank is used as found, "
-                         "otherwise the best edlib alignment; base qualities are not used")
+        prog            = "barcodex",
+        description     = "Fast quality-aware barcode -> target association",
+        formatter_class = argparse.ArgumentDefaultsHelpFormatter
+    )
 
-    # step3 : barcode extraction (S1)
-    g = ap.add_argument_group("barcode extraction (in --barcode_read)")
+    ap.add_argument("--barcode_read",   type = str, nargs = "+", help = "Fastq files of barcodes")
+    ap.add_argument("--target_read",    type = str, nargs = "+", help = "Fastq files of targets")
+    ap.add_argument("--out",            type = str,              help="output prefix")
+    ap.add_argument("--method",         type = str, nargs = 2,   choices = METHODS, metavar = ("BARCODE", "TARGET"),
+                                        help = "method for barcode and target extraction from their reads."
+                                               "none (the whole read), pos (by position), flank (between flanking sequences)."
+                                               "eg: --method flank pos, flank for barcode, pos for target")
+    ap.add_argument("--flank_mismatch", type = int, default = 2,
+                                        help = "the max mismatches allowed in the flanking sequences "
+                                               "when using the flank method")
+
+    g = ap.add_argument_group("barcode extraction")
     add_extraction_options(g, "barcode")
-    g.add_argument("--barcode_temp", default=None,
-                   help="barcode template of A/C/G/T/N, e.g. NNNNATNNNNATNN: the barcode must "
-                        "have this length and match the fixed (non-N) bases; mismatching fixed "
-                        "bases (<= --barcode_temp_mismatch) are corrected to the template")
-    g.add_argument("--barcode_temp_mismatch", type=int, default=1,
-                   help="max mismatches at the fixed bases of --barcode_temp")
 
-    # step4 : barcode clustering (S2)
+    g.add_argument("--barcode_temp",          type = str,   default = None, help = "the template sequence of barcode, eg: NNNNATNNNNATNNNNATNN")
+    g.add_argument("--barcode_temp_mismatch", type = int,   default = 1,    help = "the max mismatches allowed in the barcode sequence")
+
     g = ap.add_argument_group("barcode clustering")
-    g.add_argument("--barcode_dist", type=int, default=1,
-                   help="max edits between barcodes at CONFIDENT bases")
-    g.add_argument("--barcode_max_lowq", type=int, default=1,
-                   help="max extra mismatches at LOW-quality barcode bases (cheap). "
-                        "0 = ignore barcode quality. Barcodes > 32 bp: quality is not used")
-    g.add_argument("--barcode_min_qual", type=int, default=20,
-                   help="Phred below this = low quality (barcode read)")
-    g.add_argument("--barcode_indel", type=int, default=0,
-                   help="max indels in a barcode (indel matching ignores quality)")
-    g.add_argument("--barcode_ratio", type=float, default=5.0,
-                   help="barcode parent count >= ratio x child count")
-    g.add_argument("--min_child_reads", type=int, default=1,
-                   help="S2 speed-up: barcodes with fewer reads than this are skipped "
-                        "entirely (neither merged into a cluster nor kept). Default 1 = "
-                        "cluster everything, singletons included. 2 = skip singletons: "
-                        "much faster, but their reads no longer count towards cluster coverage")
-    g.add_argument("--min_barcode_reads", type=int, default=None,
-                   help="drop barcodes with fewer reads that match no parent "
-                        "(default: --min_pair_reads); keeps the barcode table small")
+    g.add_argument("--barcode_dist",          type = int,   default = 1,    help = "the max dist/edits using to cluster barcodes")
+    g.add_argument("--barcode_max_lowq",      type = int,   default = 1,    help = "the max mismatches at low quality bases, 0 = ignore quality")
+    g.add_argument("--barcode_min_qual",      type = int,   default = 20,   help = "the min Phred quality score to consider a base as high quality")
+    g.add_argument("--barcode_indel",         type = int,   default = 0,    help = "the max indels in a barcode")
+    g.add_argument("--barcode_ratio",         type = float, default = 5.0,  help = "barcode parent count >= ratio x child count")
+    g.add_argument("--min_child_reads",       type = int,   default = 1,    help = "speed-up: barcodes with fewer reads than this are skipped in the clustering")
+    g.add_argument("--min_barcode_reads",     type = int,   default = None, help = "drop barcodes with fewer reads that match no parent (default: --min_pair_reads)")
 
-    # step5 : target extraction (S1)
-    g = ap.add_argument_group("target extraction (in --target_read)")
+    g = ap.add_argument_group("target extraction")
     add_extraction_options(g, "target")
 
-    # step6 : target clustering (S4)
-    g = ap.add_argument_group("target clustering within a barcode (PCR / sequencing errors)")
-    g.add_argument("--target_dist", type=int, default=2,
-                   help="max confident edits (indels + high-quality mismatches)")
-    g.add_argument("--target_max_lowq", type=int, default=5,
-                   help="max extra mismatches at LOW-quality bases (free). 0 = ignore quality")
-    g.add_argument("--target_min_qual", type=int, default=20,
-                   help="Phred below this = low quality (target read)")
-    g.add_argument("--target_max_indel", type=int, default=1,
-                   help="max indels in target (0 = off)")
-    g.add_argument("--target_ratio", type=float, default=5.0,
-                   help="pair coverage rule: parent reads >= ratio x child reads")
-    g.add_argument("--target_lowq_ratio", type=float, default=1.0,
-                   help="same, when differences are only at low-quality bases")
+    g = ap.add_argument_group("target clustering")
+    g.add_argument("--target_dist",           type = int,   default = 2,    help = "the max dist/edits using to cluster targets")
+    g.add_argument("--target_max_lowq",       type = int,   default = 5,    help = "the max mismatches at low quality bases, 0 = ignore quality")
+    g.add_argument("--target_min_qual",       type = int,   default = 20,   help = "the min Phred quality score to consider a base as high quality")
+    g.add_argument("--target_max_indel",      type = int,   default = 1,    help = "the max indels in a target")
+    g.add_argument("--target_ratio",          type = float, default = 5.0,  help = "target parent count >= ratio x child count")
+    g.add_argument("--target_lowq_ratio",     type = float, default = 1.0,  help = "same, when differences are only at low-quality bases")
 
-    # step7 : pair resolution options (S5) and run-mode switches
-    g = ap.add_argument_group("pair resolution (S5, DuckDB)")
-    g.add_argument("--min_pair_reads", type=int, default=2,
-                   help="min reads supporting the (barcode, target) pair")
-    g.add_argument("--min_purity", type=float, default=0.8,
-                   help="min fraction of a barcode's reads supporting its top target")
-    g.add_argument("--min_purity_reads", type=int, default=1,
-                   help="purity counts only the targets with >= this many reads (after target "
-                        "clustering; the top target always counts): purity = top target reads / "
-                        "reads of those targets. 1 = all of the barcode's reads; 2 = 1-read "
-                        "targets (mostly noise) do not lower the purity")
-    g.add_argument("--db", default="",
-                   help="DuckDB file to keep (default: in-memory, spills to <out>.duckdb.tmp)")
-    g.add_argument("--resolve_only", action="store_true",
-                   help="skip S1-S4, re-run S5 on the existing <out>.meta/ files")
-    g.add_argument("--no_resolve", action="store_true",
-                   help="stop after S4 (writes only <out>.meta/target_pairs.tsv)")
-    g.add_argument("--clean_meta", action="store_true",
-                   help="delete <out>.meta/ after S5 (then --resolve_only is no longer possible)")
+    g = ap.add_argument_group("pairing resolution")
+    g.add_argument("--min_pair_reads",        type = int,   default = 2,    help = "the min reads supporting the (barcode, target) pair")
+    g.add_argument("--min_purity",            type = float, default = 0.8,  help = "the min fraction of a barcode's reads supporting its top target")
+    g.add_argument("--min_purity_reads",      type = int,   default = 1,    help = "purity counts only the targets with >= X reads after clustering"
+                                                                                   "purity = top target reads / reads of those targets. ")
+    
+    g.add_argument("--db",                                  default = "",   help = "DuckDB file to keep (default: in-memory, spills to <out>.duckdb.tmp)")
+    g.add_argument("--resolve_only",          action = "store_true",        help = "skip S1-S4, re-run S5 on the existing <out>.meta/ files")
+    g.add_argument("--no_resolve",            action = "store_true",        help = "stop after S4 (writes only <out>.meta/target_pairs.tsv)")
+    g.add_argument("--clean_meta",            action = "store_true",        help = "delete <out>.meta")
 
-    # step8 : resources and housekeeping options
     g = ap.add_argument_group("resources")
-    g.add_argument("--threads", type=int, default=default_threads(),
-                   help="worker processes (default: job slots from LSF/SLURM, else affinity)")
-    g.add_argument("--mem_gb", type=float, default=default_mem_gb(),
-                   help="total RAM budget; set to your bsub -M / --mem value")
-    g.add_argument("--shards", type=int, default=64, help="number of S3/S4 shards")
-    g.add_argument("--chunk", type=int, default=100000, help="reads per parse chunk")
-    g.add_argument("--agg_entries", type=int, default=0,
-                   help="max aggregated (barcode,target) entries per worker before a part is "
-                        "written (0 = derive from --mem_gb)")
-    g.add_argument("--compact_parts", type=int, default=12,
-                   help="compact text parts into Parquet when this many are pending")
-    g.add_argument("--merge_files", type=int, default=6,
-                   help="merge this many same-level Parquet files into the next level")
-    g.add_argument("--max_cand", type=int, default=5000,
-                   help="seeds shared by more than this many heavy barcodes are ignored")
-    g.add_argument("--max_dp_group", type=int, default=1000,
-                   help="barcodes with more distinct target variants than this skip the "
-                        "(slow) indel search")
-    g.add_argument("--max_parents", type=int, default=200,
-                   help="within one barcode, each target variant is compared only with the N "
-                        "most abundant variants (bounds the O(n^2) cost of huge/junk barcodes)")
-    g.add_argument("--tmp", default="",
-                   help="parent dir for the work dir (default: next to --out); use fast scratch")
-    g.add_argument("--keep_tmp", action="store_true")
-    g.add_argument("--resume", action="store_true",
-                   help="continue a previous run from the last finished step")
-    g.add_argument("--no_pigz", action="store_true", help="do not use pigz even if installed")
-    g.add_argument("--max_reads", type=int, default=0,
-                   help="pilot run: only use the first ~N reads")
+    g.add_argument("--threads",               type = int,   default = default_threads(), help = "worker processes")
+    g.add_argument("--mem_gb",                type = float, default = default_mem_gb(),  help = "RAM limit")
+    g.add_argument("--shards",                type = int,   default = 64,                help = "number of S3/S4 shards")
+    g.add_argument("--chunk",                 type = int,   default = 100000,            help = "reads per parse chunk")
+    g.add_argument("--agg_entries",           type = int,   default = 0,                 help = "max aggregated (barcode,target) per worker before a part is written (0 = derive from --mem_gb)")
+    g.add_argument("--compact_parts",         type = int,   default = 12,                help = "compact text parts into parquet when X are pending")
+    g.add_argument("--merge_files",           type = int,   default = 6,                 help = "merge X same-level parquet files into the next level")
+    g.add_argument("--max_cand",              type = int,   default = 5000,              help = "seeds shared by more than X heavy barcodes are ignored")
+    g.add_argument("--max_dp_group",          type = int,   default = 1000,              help = "barcodes with more distinct target variants than X skip the process")
+    g.add_argument("--max_parents",           type = int,   default = 200,               help = "within one barcode, each target is compared only with X most abundant targets")
+    g.add_argument("--tmp",                   type = str,   default = "",                help = "parent dir for the work dir (default: next to --out)")
+    g.add_argument("--keep_tmp",              action = "store_true")
+    g.add_argument("--resume",                action = "store_true")
+    g.add_argument("--no_pigz",               action = "store_true")
+    g.add_argument("--max_reads",             type = int,   default = 0,                 help = "pilot run: only use the first X reads")
 
-    # step9 : general options
-    ap.add_argument("--phred_offset", type=int, default=33)
-    ap.add_argument("--barcode_map", action="store_true", help="write barcode -> centre table")
-    ap.add_argument("--fastq", action="store_true", help="write representative FASTQ pair")
-    ap.add_argument("--selftest", action="store_true", help="run on synthetic data and exit")
-    ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
-    # step10 : parse
+    ap.add_argument("--phred_offset",         type = int,   default = 33)
+    ap.add_argument("--barcode_map",          action="store_true",                       help = "write barcode -> centre table")
+    ap.add_argument("--fastq",                action="store_true",                       help = "write representative FASTQ pair")
+    ap.add_argument("--selftest",             action="store_true",                       help = "run on synthetic data and exit")
+    ap.add_argument("--version",              action="version",                          version="%(prog)s " + __version__)
+
     return ap.parse_args(argv)
 
 
