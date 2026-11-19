@@ -460,21 +460,19 @@ def stage_barcodes(args, work, threads, mem_gb):
         "GROUP BY barcode) "
         f"TO {sql_str(census_base)} (FORMAT PARQUET, COMPRESSION ZSTD)"
     )
-    #      |----   substep reads, distinct barcodes and the barcode length range
+
     n_distinct, n_reads, min_len, max_len = con.execute(
         "SELECT COUNT(*), SUM(n), MIN(length(b)), MAX(length(b)) "
         f"FROM read_parquet({sql_str(census_base)})"
     ).fetchone()
     log_sub(f"{n_reads} reads, {n_distinct} distinct barcodes (length {min_len}-{max_len})")
-    #      |----   substep distinct raw target sequences (for the stats file)
+
     n_raw_targets = con.execute(
         "SELECT COUNT(*) "
         f"FROM (SELECT target FROM {tuples} GROUP BY target)"
     ).fetchone()[0]
     log_sub(f"{n_raw_targets} distinct raw target sequences")
-    #      |----   substep distinct raw (barcode, target) pairs (for the stats file)
-    #      |----   substep one compacted file holds unique (barcode, target) rows: its row count is the answer;
-    #      |----   substep several tiers can repeat a pair, so count distinct 128-bit md5 keys of the pair
+
     tuple_files = glob.glob(work + "/tuples/t*.parquet")
     if len(tuple_files) == 1:
         n_raw_pairs = con.execute(f"SELECT COUNT(*) FROM {tuples}").fetchone()[0]
@@ -487,36 +485,35 @@ def stage_barcodes(args, work, threads, mem_gb):
         ).fetchone()[0]
     log_sub(f"{n_raw_pairs} distinct raw (barcode, target) pairs")
 
-    # step3 : settings: ratio, distances, quality mode and seed layout
-    ratio = max(args.barcode_ratio, 1.0)        # parent count >= ratio x child count
-    max_hard = args.barcode_dist                # edits at confident bases
-    band = min(args.barcode_indel, max_hard)    # indels allowed
-    #      |----   substep quality-aware matching needs barcodes <= 32 bp (packed in one 64-bit word)
+    # step3: ratio, distances, quality mode and seed layout
+    ratio = max(args.barcode_ratio, 1.0)   
+    max_hard = args.barcode_dist      
+    band = min(args.barcode_indel, max_hard)
     use_quality = args.barcode_max_lowq > 0 and max_len <= MAX_QUAL_BARCODE_LEN
     max_low = args.barcode_max_lowq if use_quality else 0
+
     if args.barcode_max_lowq > 0 and not use_quality:
         log_sub(f"NOTE: barcodes longer than {MAX_QUAL_BARCODE_LEN} bp: "
                 "quality-aware clustering off for barcodes")
-    #      |----   substep pigeonhole seeds: pairs with <= max_hard+max_low differences share one of (max_hard+max_low+1)
+
+    #      |----   substep pigeonhole seeds: pairs with <= (max_hard + max_low) differences share one of (max_hard + max_low + 1)
     #      |----   substep seeds exactly; lower max_low while the seeds would get shorter than MIN_SEED_LEN
     while use_quality and max_low > 0 and min_len // (max_hard + max_low + 1) < MIN_SEED_LEN:
         max_low -= 1
         log_sub(f"NOTE: barcodes too short for the requested --barcode_max_lowq; using {max_low}")
-    #      |----   substep final seed layout
+
     n_seeds = max_hard + max_low + 1
     seed_len = min_len // n_seeds
     if seed_len < MIN_SEED_LEN:
         raise SystemExit(f"ERROR: barcodes too short for --barcode_dist {max_hard}")
+    
     #      |----   substep read-count thresholds for dropping light barcodes
-    min_barcode_reads = (args.min_barcode_reads if args.min_barcode_reads is not None
-                         else args.min_pair_reads)
+    min_barcode_reads = (args.min_barcode_reads if args.min_barcode_reads is not None else args.min_pair_reads)
     min_child_reads = max(1, args.min_child_reads)
 
-    # step4 : census table used by all later queries
+    # step4: census table used by all later queries
     if use_quality:
-        # add code / conf words (see packed_barcode_sql); mask bit 1 = low quality
-        code_expr, conf_expr = packed_barcode_sql(
-            max_len, max_len if min_len == max_len else 0)
+        code_expr, conf_expr = packed_barcode_sql(max_len, max_len if min_len == max_len else 0)
         con.execute(
             "COPY (SELECT b, "
             "n, "
@@ -533,15 +530,13 @@ def stage_barcodes(args, work, threads, mem_gb):
         census_file = census_base
         columns = "b, n"
 
-    #      |----   substep helper: SQL that matches a barcode table to its best heavy parents
     def matched(src):
         """
-        SQL that matches every row of `src` to its best heavy parent (quality-aware or sequence-only,
-        depending on the settings of the enclosing stage_barcodes call).
+        SQL that matches every row to its best heavy parent
         Parameters:
-                -- src: str: SQL table/subquery with columns b, n (+ code, conf when quality-aware)
+            -- src: str: SQL table/subquery with columns b, n (+ code, conf when quality-aware)
         Returns:
-                -- str: SQL query returning (barcode, n, parent_id)
+            -- str: SQL query returning (barcode, n, parent_id)
         """
         if use_quality:
             return matched_query_quality(src, seed_len, n_seeds, ratio, max_hard, max_low, band)
@@ -550,7 +545,7 @@ def stage_barcodes(args, work, threads, mem_gb):
     #      |----   substep census source for the following queries
     census = f"read_parquet({sql_str(census_file)})"
 
-    # step5 : heavy barcodes = the only possible parents; build their seed index
+    # step5: heavy barcodes = the only possible parents; build their seed index
     # Every heavy barcode gets an integer id (hid).  All big joins below use ids and 64-bit
     # seed hashes instead of the barcode strings, so the join tables stay small and in memory.
     #      |----   substep heavy table: integer id (hid) + packed barcode columns
@@ -562,6 +557,7 @@ def stage_barcodes(args, work, threads, mem_gb):
     )
     n_heavy = con.execute("SELECT COUNT(*) FROM heavy").fetchone()[0]
     log_sub(f"{n_heavy} heavy barcodes (count >= {ratio:g}) can be cluster centres/parents")
+
     #      |----   substep seed index of the heavy set: (slot, seed hash, heavy id); seeds shared by more than --max_cand
     #      |----   substep heavy barcodes (low complexity) are dropped to bound the join size
     con.execute(f"""
@@ -577,7 +573,7 @@ def stage_barcodes(args, work, threads, mem_gb):
             f"({n_seeds} seeds of {seed_len} bp per heavy barcode); "
             f"spill so far {spill_gb(work):.1f} GB")
 
-    # step6 : heavy barcodes: best heavy parent, then pointer jumping to the root
+    # step6: heavy barcodes: best heavy parent, then pointer jumping to the root
     #      |----   substep pin the join order: children JOIN integer seed index JOIN heavy strings
     pin_join_order(con, True)
     #      |----   substep best heavy parent of every heavy barcode (hroot: hid -> root_id)
@@ -590,9 +586,10 @@ def stage_barcodes(args, work, threads, mem_gb):
     n_with_parent = con.execute("SELECT COUNT(*) FROM hroot WHERE root_id <> hid").fetchone()[0]
     log_sub(f"{n_with_parent} of {n_heavy} heavy barcodes have a more abundant heavy parent; "
             f"spill so far {spill_gb(work):.1f} GB")
+    
     #      |----   substep pointer jumping: root := root of root, until nothing changes
     jump_round = 0
-    while True:                                 # root := root of root, until nothing changes
+    while True:                    
         jump_round += 1
         con.execute(
             "CREATE OR REPLACE TABLE hroot2 AS "
@@ -611,6 +608,7 @@ def stage_barcodes(args, work, threads, mem_gb):
         log_sub(f"pointer jumping round {jump_round}: {n_changed} heavy barcodes changed root")
         if not n_changed:
             break
+
     #      |----   substep centre barcode (string) of every heavy barcode (hcentre)
     con.execute(
         "CREATE OR REPLACE TABLE hcentre AS "
@@ -619,33 +617,34 @@ def stage_barcodes(args, work, threads, mem_gb):
         "JOIN heavy c ON c.hid = r.root_id"
     )
 
-    # step7 : every barcode -> centre barcode (writes bcmap.parquet)
+    # step7: every barcode -> centre barcode
     #  heavy barcode            -> its root
     #  light barcode, parent    -> root of its heavy parent
     #  light barcode, no parent -> its own centre, only if it has >= min_barcode_reads reads
-    # The expensive light-barcode join runs ONCE (table lmatch); later steps reuse it.
-    # Light barcodes below --min_child_reads are ignored completely (not matched, not kept).
-    #      |----   substep children = light barcodes (n < ratio and n >= --min_child_reads)
     children = (
         f"(SELECT {columns} "
         f"FROM {census} "
         f"WHERE n < {float(ratio)!r} "
         f"AND n >= {min_child_reads})"
     )
+
     #      |----   substep save the query plan to check the join order
     dump_plan(con, matched(children), work + "/explain_light_match.txt")
     log_sub("matching light barcodes to heavy parents (the longest step) ...")
-    #      |----   substep match light barcodes to heavy parents (expensive join; run once, reused below)
+
+    #      |----   substep match light barcodes to heavy parents
     con.execute(
         "CREATE OR REPLACE TABLE lmatch AS "
         "SELECT barcode, n, parent_id, hash(barcode) AS hk "
         f"FROM ({matched(children)})"
     )
+
     #      |----   substep release the join-order pin
     pin_join_order(con, False)
     n_lmatch = con.execute("SELECT COUNT(*) FROM lmatch").fetchone()[0]
     log_sub(f"{n_lmatch} light barcodes matched to a heavy parent; "
             f"spill so far {spill_gb(work):.1f} GB")
+
     #      |----   substep light barcodes without a parent keep their own centre when they have enough reads
     #      |----   substep (anti-join on the 64-bit barcode hash: no strings in the join table)
     con.execute(f"""
@@ -656,6 +655,7 @@ def stage_barcodes(args, work, threads, mem_gb):
     """)
     n_lown = con.execute("SELECT COUNT(*) FROM lown").fetchone()[0]
     log_sub(f"{n_lown} light barcodes without a parent kept as their own cluster")
+
     #      |----   substep bcmap.parquet = heavy -> root | light with parent -> root of parent | light own centre
     con.execute(f"""
         COPY (
@@ -668,6 +668,7 @@ def stage_barcodes(args, work, threads, mem_gb):
             SELECT b, b, n FROM lown                                     
         ) TO {sql_str(bcmap)} (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
+
     #      |----   substep report mapped / dropped barcodes
     n_mapped, n_centres, n_mapped_reads = con.execute(
         "SELECT COUNT(*), COUNT(*) FILTER (WHERE barcode = centre), SUM(n) "
@@ -678,6 +679,7 @@ def stage_barcodes(args, work, threads, mem_gb):
             f"dropped {n_distinct - n_mapped} barcodes ({n_dropped_reads} reads) "
             f"(unmatched with < {min_barcode_reads} reads, "
             f"or < {min_child_reads} reads = --min_child_reads)")
+    
     #      |----   substep save the raw counts and the reads kept by the clustering for S5 (raw_stats.json)
     os.makedirs(meta_path(args), exist_ok=True)
     with open(meta_path(args, "raw_stats.json"), "w") as fo:
@@ -685,14 +687,10 @@ def stage_barcodes(args, work, threads, mem_gb):
                    "raw_barcode_target_pairs": n_raw_pairs,
                    "reads_in": n_reads, "reads_clustered": n_mapped_reads or 0}, fo)
 
-    # step8 : per barcode-cluster statistics (used for the final barcode file)
+    # step8: per barcode-cluster statistics (used for the final barcode file)
     #   count      = reads of all barcodes merged into the cluster (coverage after clustering)
     #   n_cluster  = number of different raw barcodes in the cluster
     #   first_cov  = reads of the most abundant barcode, second_cov = of the second one (0 if none)
-    # Clusters with a heavy centre are grouped by integer id (narrow rows, no strings; the two
-    # largest counts by max(n, 2), no window sort); light barcodes that are their own centre are
-    # clusters of size 1.
-    #      |----   substep meta/barcode_clusters.parquet: count, n_cluster, first_cov, second_cov per centre
     clusters_out = sql_str(meta_path(args, "barcode_clusters.parquet"))
     con.execute(f"""
         COPY (
@@ -713,6 +711,7 @@ def stage_barcodes(args, work, threads, mem_gb):
         ) TO {clusters_out} (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
     log_sub("barcode cluster statistics written")
+
     #      |----   substep optional barcode -> centre table (--barcode_map)
     if args.barcode_map:
         map_out = sql_str(args.out + ".barcode_map.tsv")
@@ -723,11 +722,10 @@ def stage_barcodes(args, work, threads, mem_gb):
         )
     con.close()
 
-    # step9 : clean up and write the --resume marker
-    #      |----   substep delete the temporary DuckDB file and the census Parquet files
+    # step9: clean up and write the --resume marker
     for f in (work + "/bc.duckdb", work + "/bc.duckdb.wal", census_base, census_q):
         if os.path.exists(f):
             os.remove(f)
-    #      |----   substep marker file used by --resume
+
     with open(work + "/bcmap.done", "w") as fo:
         fo.write("ok\n")
