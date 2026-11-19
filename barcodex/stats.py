@@ -144,14 +144,13 @@ def barcode_clustering_stats(con, raw_stats):
     return rows
 
 
-def target_clustering_stats(con, raw_stats, merged):
+def target_clustering_stats(con, raw_stats):
     """
     Step 4: reads lost / kept by the target clustering within each barcode and the targets
     after it.
     Parameters:
-            -- con: duckdb connection with table pairs (S4 output) (and tmap if merged)
+            -- con: duckdb connection with table pairs (S4 output)
             -- raw_stats: dict: content of raw_stats.json (S2)
-            -- merged: bool: True = --merge_dist > 0 (table tmap exists)
     Returns:
             -- list[Stat]: rows
     """
@@ -159,10 +158,6 @@ def target_clustering_stats(con, raw_stats, merged):
     reads_in, n_targets = con.execute(
         "SELECT COALESCE(SUM(target_reads), 0), COUNT(DISTINCT tk) FROM pairs").fetchone()
     text = "distinct targets (target cluster sequences) after clustering within each barcode"
-    if merged:
-        n_targets = con.execute("SELECT COUNT(DISTINCT root) FROM tmap").fetchone()[0]
-        text = ("distinct targets after clustering within each barcode and merging across "
-                "barcodes (--merge_dist)")
     rows = []
     if "reads_clustered" in raw_stats:
         rows.append(Stat(step, "reads_dropped_target_clustering",
@@ -179,7 +174,7 @@ def assignment_stats(con, args):
     Step 5: one target per barcode: multi-target barcodes and the barcodes / reads per status.
     Parameters:
             -- con: duckdb connection with table barcode_assign
-            -- args: argparse.Namespace: min_pair_reads, min_purity
+            -- args: argparse.Namespace: min_pair_reads, min_purity, min_purity_reads
     Returns:
             -- list[Stat]: rows
     """
@@ -195,13 +190,18 @@ def assignment_stats(con, args):
                COALESCE(SUM(barcode_reads) FILTER (WHERE status = 'low_coverage'), 0)
         FROM barcode_assign""").fetchone()
     step = "5_target_assignment"
-    mp, pur = args.min_pair_reads, args.min_purity
+    mp, pur, mpr = args.min_pair_reads, args.min_purity, args.min_purity_reads
+    if mpr > 1:
+        of = ("the barcode's reads, not counting its other targets with < %d reads "
+              "(--min_purity_reads)" % mpr)
+    else:
+        of = "the barcode's reads"
     resolved = ("multi-target barcodes resolved to ONE target: their top target has >= %d reads "
-                "(--min_pair_reads) and >= %g of the barcode's reads (--min_purity); kept with "
-                "that target" % (mp, pur))
+                "(--min_pair_reads) and >= %g of %s (--min_purity); kept with "
+                "that target" % (mp, pur, of))
     ambiguous = ("multi-target barcodes NOT resolved: their top target has >= %d reads "
-                 "(--min_pair_reads) but < %g of the barcode's reads (--min_purity), no "
-                 "dominant target; dropped" % (mp, pur))
+                 "(--min_pair_reads) but < %g of %s (--min_purity), no "
+                 "dominant target; dropped" % (mp, pur, of))
     low = ("barcodes (single- or multi-target) whose top target has < %d reads "
            "(--min_pair_reads); dropped" % mp)
     return [
@@ -268,13 +268,12 @@ def collect_stats(con, raw_stats, ingest_stats, args):
             -- con: duckdb connection after assign_targets (tables pairs, final, barcode_assign)
             -- raw_stats: dict: content of raw_stats.json (S2)
             -- ingest_stats: dict or None: content of ingest_stats.json (S1)
-            -- args: argparse.Namespace: min_pair_reads, min_purity, merge_dist
+            -- args: argparse.Namespace: min_pair_reads, min_purity, min_purity_reads
     Returns:
             -- list[Stat]: rows
     """
-    merged = getattr(args, "merge_dist", 0) > 0
     return (extraction_stats(ingest_stats, raw_stats) + barcode_clustering_stats(con, raw_stats)
-            + target_clustering_stats(con, raw_stats, merged) + assignment_stats(con, args)
+            + target_clustering_stats(con, raw_stats) + assignment_stats(con, args)
             + final_map_stats(con))
 
 

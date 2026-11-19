@@ -16,7 +16,7 @@ from datetime import datetime
 from . import __version__
 from .common import default_mem_gb, default_threads, log
 from .constants import MAX_TARGET_LEN
-from .extract import FLANK_DISTANCES, METHODS, spec_from_args, validate_spec
+from .extract import METHODS, spec_from_args, validate_spec
 
 # file (in the output directory) that collects the command of every run
 CMD_LOG = "cmd.log"
@@ -76,19 +76,17 @@ def parse_args(argv=None):
                          "(--*_start, --*_len); flank = between flanking sequences (--*_up, "
                          "--*_down). Example: --method flank none")
     ap.add_argument("--flank_mismatch", type=int, default=2,
-                    help="method flank: max mismatches in each flanking sequence, "
-                         "barcode and target; base qualities are not used to find the flanks")
-    ap.add_argument("--flank_distance", choices=FLANK_DISTANCES, default="hamming",
-                    help="method flank: how a flank is matched to a window of its length: "
-                         "hamming = substitutions only (numpy); levenshtein = substitutions "
-                         "and indels (edlib)")
+                    help="method flank: max edits (substitutions and indels) in each flanking "
+                         "sequence, barcode and target. An exact flank is used as found, "
+                         "otherwise the best edlib alignment; base qualities are not used")
 
     # step3 : barcode extraction (S1)
     g = ap.add_argument_group("barcode extraction (in --barcode_read)")
     add_extraction_options(g, "barcode")
     g.add_argument("--barcode_temp", default=None,
                    help="barcode template of A/C/G/T/N, e.g. NNNNATNNNNATNN: the barcode must "
-                        "have this length and match the fixed (non-N) bases")
+                        "have this length and match the fixed (non-N) bases; mismatching fixed "
+                        "bases (<= --barcode_temp_mismatch) are corrected to the template")
     g.add_argument("--barcode_temp_mismatch", type=int, default=1,
                    help="max mismatches at the fixed bases of --barcode_temp")
 
@@ -139,11 +137,11 @@ def parse_args(argv=None):
                    help="min reads supporting the (barcode, target) pair")
     g.add_argument("--min_purity", type=float, default=0.8,
                    help="min fraction of a barcode's reads supporting its top target")
-    g.add_argument("--merge_dist", type=int, default=0,
-                   help="merge targets within this Hamming distance ACROSS barcodes "
-                        "(0 = exact only; keep 0 for short targets)")
-    g.add_argument("--merge_ratio", type=float, default=5.0,
-                   help="across-barcode merge: parent total reads >= ratio x child total reads")
+    g.add_argument("--min_purity_reads", type=int, default=1,
+                   help="purity counts only the targets with >= this many reads (after target "
+                        "clustering; the top target always counts): purity = top target reads / "
+                        "reads of those targets. 1 = all of the barcode's reads; 2 = 1-read "
+                        "targets (mostly noise) do not lower the purity")
     g.add_argument("--db", default="",
                    help="DuckDB file to keep (default: in-memory, spills to <out>.duckdb.tmp)")
     g.add_argument("--resolve_only", action="store_true",
@@ -221,6 +219,8 @@ def validate_args(args):
             errors += validate_spec(spec_from_args(args, role, True, max_len))
         except ValueError as e:
             errors.append("--%s_allowed_lens: %s" % (role, e))
+    if args.min_purity_reads < 1:
+        errors.append("--min_purity_reads must be >= 1")
     if errors:
         raise SystemExit("ERROR:\n  " + "\n  ".join(errors))
     # step3 : flank method without a length filter can produce very short barcodes (S2 seeds)

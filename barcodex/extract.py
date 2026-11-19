@@ -7,16 +7,15 @@ Three methods, chosen independently for the barcode and the target with
   pos    by position: --*_start (0-based) and --*_len (0 = to the end of the read)
   flank  the sequence between an upstream (--*_up) and a downstream (--*_down) flanking
          sequence.  Flanks are matched on the sequence only (base qualities are not used),
-         with up to --flank_mismatch mismatches (extract_sequence of sequence_utils.py).  The
-         downstream flank is searched after the end of the upstream flank.  How a flank is
-         searched is chosen with --flank_distance:
-           hamming      the first window (of the flank length) with <= --flank_mismatch
-                        substitutions; all windows are compared at once with numpy
-                        (match_hamming_numpy)
-           levenshtein  the first window (of the flank length) whose edit distance to the
-                        flank, substitutions and indels, is <= --flank_mismatch (edlib,
-                        match_levenshtein)
-         The sequence starts len(--*_up) bases after the start of the upstream window.
+         with up to --flank_mismatch edits per flank; the downstream flank is searched after
+         the end of the upstream flank (find_flank):
+           1 exact match (bytes.find, C speed; most reads)
+           2 otherwise the best edlib infix alignment, substitutions and indels (match_edlib)
+         The sequence starts at the end of the upstream flank match and ends at the start of
+         the downstream flank match.  These are the alignment boundaries, so an indel inside a
+         flank does not shift the barcode / target.  (A Hamming window search with mismatches
+         is not used: an indel near the inner end of a flank shifts only its last bases, so a
+         Hamming window accepts it with 1-2 mismatches and the sequence comes out shifted.)
 
 Optional filters, applied after the extraction:
   max_len            hard limit set by the code (targets: 255 bp, the width of the quality mask)
@@ -24,21 +23,20 @@ Optional filters, applied after the extraction:
   --*_allowed_lens   keep only sequences of these lengths, e.g. "19,20,21" or "18-22"
   --barcode_temp     barcode template, e.g. NNNNATNNNNATNN: the barcode must have the template
                      length and match its fixed (non-N) bases with <= --barcode_temp_mismatch
-                     mismatches
+                     mismatches; the mismatching fixed bases are then corrected to the template
+                     (SequenceExtractor.fix)
 
 CHECK ORDER  (a rejected read pair is counted once, under the FIRST reason that hits it, so the
 reject counters add up to the number of rejected pairs; see reject_reason_order)
   1 target extraction   2 barcode extraction   3 target filters   4 barcode filters
 """
 
+import re
 from dataclasses import dataclass, field
 
 import edlib
-import numpy as np
-from numpy.lib.stride_tricks import sliding_window_view
 
 METHODS = ("none", "pos", "flank")
-FLANK_DISTANCES = ("hamming", "levenshtein")
 TEMPLATE_BASES = set("ACGTN")
 
 
@@ -58,8 +56,6 @@ class ExtractSpec:
             -- up: str: flank method: upstream flanking sequence
             -- down: str: flank method: downstream flanking sequence
             -- flank_mismatch: int: flank method: max edits per flank
-            -- flank_distance: str: flank method: 'hamming' (substitutions) or 'levenshtein'
-               (substitutions and indels)
             -- max_len: int: reject longer sequences (0 = off; set by the code, not an option)
             -- min_len: int: reject shorter sequences (0 = off)
             -- allowed_lens: frozenset[int]: accepted lengths (empty = any length)
@@ -76,7 +72,6 @@ class ExtractSpec:
     up: str = ""
     down: str = ""
     flank_mismatch: int = 0
-    flank_distance: str = "hamming"
     max_len: int = 0
     min_len: int = 0
     allowed_lens: frozenset = field(default_factory=frozenset)
@@ -133,7 +128,6 @@ def spec_from_args(args, role, require_full_len, max_len=0):
                        require_full_len=require_full_len,
                        up=(opt("up") or "").upper(), down=(opt("down") or "").upper(),
                        flank_mismatch=args.flank_mismatch,
-                       flank_distance=getattr(args, "flank_distance", "hamming"),
                        max_len=max_len,
                        min_len=opt("min_len"),
                        allowed_lens=parse_allowed_lens(opt("allowed_lens")),
@@ -161,8 +155,6 @@ def validate_spec(spec):
         errors.append("--%s_up / --%s_down need the %s method flank" % (role, role, role))
     if spec.method == "flank" and not (spec.up and spec.down):
         errors.append("%s method flank needs --%s_up and --%s_down" % (role, role, role))
-    if spec.flank_distance not in FLANK_DISTANCES:
-        errors.append("--flank_distance must be one of %s" % ", ".join(FLANK_DISTANCES))
     # step2 : numbers and flanks
     for name, value in (("--%s_start" % role, spec.start), ("--%s_len" % role, spec.length),
                         ("--flank_mismatch", spec.flank_mismatch),
@@ -280,126 +272,93 @@ def reject_reason_order(barcode_spec, target_spec):
 
 # ---- sequence matching -----------------------------------------------------
 
-def match_hamming_numpy(seq, pattern, max_mismatches):
+def match_edlib(seq, pattern, max_edits):
     """
-    First window of seq with <= max_mismatches Hamming mismatches to pattern (match_hamming_numpy
-    of sequence_utils.py): all windows are compared at once with numpy.  Only the windows up to
-    an exact match are compared (a later window cannot be the first one), same result.
+    Best infix alignment of pattern in seq with <= max_edits substitutions and indels (edlib HW).
+    The alignment's own boundaries are returned, so an indel inside the flank moves the flank
+    end (upstream) / start (downstream) by the right number of bases.  Several alignments with
+    the same, smallest edit distance: prefer one of the pattern length (substitutions only, much
+    more frequent than indels on Illumina), then the leftmost.
+    edlib reports one start per alignment end, so an equally good alignment of the pattern
+    length that shares the end (or the start) is not in its list; it is checked here.  Example:
+    read ...TTGG ATAAGTTC..., flank GTAAGTTC...: 'G>A substitution' and 'flank G, insertion A'
+    both cost 1; edlib reports the insertion (target ...TTG), the substitution (target ...TTGG)
+    is chosen.
     Parameters:
             -- seq: bytes: sequence to search in (upper case)
             -- pattern: bytes: pattern to match (upper case)
-            -- max_mismatches: int: mismatches allowed
+            -- max_edits: int: edits allowed
     Returns:
-            -- int: start index of the match, or -1 if not found
+            -- tuple or None: (start, end, edit distance) of the match, end exclusive, or None
     """
     k = len(pattern)
-    exact = seq.find(pattern)
-    if exact == 0 or max_mismatches == 0:
-        return exact
-    n = len(seq) if exact < 0 else exact + k                # windows 0 .. exact
-    if k > n:
-        return -1
-    # sliding window: a 2D view of seq of shape (n - k + 1, k)
-    windows = sliding_window_view(np.frombuffer(seq, dtype=np.uint8, count=n), window_shape=k)
-    mismatches = np.sum(windows != np.frombuffer(pattern, dtype=np.uint8), axis=1)
-    matches = np.where(mismatches <= max_mismatches)[0]
-    return int(matches[0]) if matches.size > 0 else -1
+    if len(seq) < k - max_edits:
+        return None
+    hit = edlib.align(pattern, seq, mode="HW", task="locations", k=max_edits)
+    dist = hit["editDistance"]
+    if dist < 0:
+        return None
+    # step1 : edlib's alignments (start, end inclusive), plus the flank-length windows that share
+    #         their end or start and need the same number of edits
+    candidates = set(hit["locations"])
+    for start, end in hit["locations"]:
+        if end + 1 - start == k:
+            continue
+        for s, e in ((end - k + 1, end), (start, start + k - 1)):
+            if (s, e) not in candidates and s >= 0 and e < len(seq) and \
+                    edlib.align(pattern, seq[s:e + 1], mode="NW", k=dist)["editDistance"] == dist:
+                candidates.add((s, e))
+    # step2 : flank length first, then the leftmost
+    start, end = min(candidates, key=lambda loc: (abs(loc[1] + 1 - loc[0] - k), loc[0]))
+    return start, end + 1, dist
 
 
-def first_levenshtein_window(seq, pattern, max_mismatches, lo, hi):
+def find_flank(seq, pattern, max_edits):
     """
-    First window start i in [lo, hi) with edit distance(seq[i:i+k], pattern) <= max_mismatches.
-    A window that matches is also an infix alignment, so a range of windows is skipped when one
-    edlib infix (HW) search over it finds nothing; otherwise the range is halved.  Ranges of
-    <= 4 windows are checked window by window exactly as match_levenshtein does.
-    Parameters:
-            -- seq: bytes: sequence to search in
-            -- pattern: bytes: pattern to match
-            -- max_mismatches: int: edits allowed
-            -- lo / hi: int: range of window starts
-    Returns:
-            -- int: start index of the first matching window, or -1
-    """
-    k = len(pattern)
-    if hi - lo <= 4:
-        for i in range(lo, hi):
-            window = seq[i:i + k]
-            if edlib.align(window, pattern, mode="NW", k=max_mismatches)["editDistance"] != -1:
-                return i
-        return -1
-    if edlib.align(pattern, seq[lo:hi + k - 1], mode="HW", k=max_mismatches)["editDistance"] == -1:
-        return -1
-    mid = (lo + hi) // 2
-    first = first_levenshtein_window(seq, pattern, max_mismatches, lo, mid)
-    return first if first >= 0 else first_levenshtein_window(seq, pattern, max_mismatches, mid, hi)
-
-
-def match_levenshtein(seq, pattern, max_mismatches):
-    """
-    First window of seq (of the pattern length) whose Levenshtein distance to pattern is
-    <= max_mismatches (match_levenshtein of sequence_utils.py, edlib NW per window).  The same
-    windows are found in fewer edlib calls by first_levenshtein_window.
+    Locate one flank in seq: an exact match first (bytes.find, C speed; most reads), otherwise
+    the best edlib alignment with <= max_edits substitutions and indels (match_edlib).
     Parameters:
             -- seq: bytes: sequence to search in (upper case)
-            -- pattern: bytes: pattern to match (upper case)
-            -- max_mismatches: int: edits allowed
+            -- pattern: bytes: flank (upper case)
+            -- max_edits: int: edits allowed
     Returns:
-            -- int: start index of the match, or -1 if not found
+            -- tuple or None: (start, end) of the flank in seq, end exclusive, or None
     """
-    k = len(pattern)
-    n = len(seq)
-    if k > n:
-        return -1
-    return first_levenshtein_window(seq, pattern, max_mismatches, 0, n - k + 1)
+    i = seq.find(pattern)
+    if i >= 0:
+        return i, i + len(pattern)
+    if max_edits == 0:
+        return None
+    hit = match_edlib(seq, pattern, max_edits)
+    return None if hit is None else hit[:2]
 
 
-def match_approximate(seq, pattern, max_mismatches, distance):
+def extract_sequence(seq, up_seq, down_seq, max_mismatches):
     """
-    Approximate match by Hamming or Levenshtein distance (match_approximate of sequence_utils.py).
-    Parameters:
-            -- seq: bytes: sequence to search in
-            -- pattern: bytes: pattern to match
-            -- max_mismatches: int: mismatches allowed
-            -- distance: str: 'hamming' or 'levenshtein'
-    Returns:
-            -- int: start index of the match, or -1 if not found
-    """
-    if distance == "hamming":
-        return match_hamming_numpy(seq, pattern, max_mismatches)
-    elif distance == "levenshtein":
-        return match_levenshtein(seq, pattern, max_mismatches)
-    else:
-        raise ValueError("Unknown distance metric: %s" % distance)
-
-
-def extract_sequence(seq, up_seq, down_seq, max_mismatches, distance):
-    """
-    Locate the sequence between approximate matches of up_seq and down_seq (extract_sequence of
-    sequence_utils.py; returns the slice instead of the substring).
+    Locate the sequence between approximate matches of up_seq and down_seq: it starts at the end
+    of the upstream flank match and ends at the start of the downstream flank match, which is
+    searched after the upstream flank.
     Parameters:
             -- seq: bytes: sequence to search in (upper case)
             -- up_seq: bytes: upstream sequence to match
             -- down_seq: bytes: downstream sequence to match
-            -- max_mismatches: int: mismatches allowed for both matches
-            -- distance: str: 'hamming' or 'levenshtein'
+            -- max_mismatches: int: edits allowed for each flank
     Returns:
             -- tuple or str: (start, end) of the sequence, or 'upstream not found' /
                'downstream not found'
     """
-    start_idx = match_approximate(seq, up_seq, max_mismatches, distance)
-    if start_idx == -1:
+    up = find_flank(seq, up_seq, max_mismatches)
+    if up is None:
         return "upstream not found"
-    start_idx += len(up_seq)
+    start_idx = up[1]
 
-    end_idx = match_approximate(seq[start_idx:], down_seq, max_mismatches, distance)
-    if end_idx == -1:
+    down = find_flank(seq[start_idx:], down_seq, max_mismatches)
+    if down is None:
         return "downstream not found"
-    end_idx += start_idx
-
-    return start_idx, end_idx
+    return start_idx, start_idx + down[0]
 
 
-def matches_template(seq, start, end, fixed_bases, template_len, max_mismatch):
+def matches_template(seq, start, end, fixed_bases, template_len, max_mismatch, exact=None):
     """
     True when seq[start:end] has the template length and differs from the template's fixed
     (non-N) bases at <= max_mismatch positions (same rule as check_barcode of sequence_utils.py).
@@ -409,11 +368,15 @@ def matches_template(seq, start, end, fixed_bases, template_len, max_mismatch):
             -- fixed_bases: tuple: ((position, base byte value), ...) of the non-N template bases
             -- template_len: int: template length
             -- max_mismatch: int: mismatches allowed
+            -- exact: compiled bytes regex of the template (N = any base) or None: fast path,
+               a full match (most reads) needs no per-base loop
     Returns:
             -- bool: True = match
     """
     if end - start != template_len:
         return False
+    if exact is not None and exact.fullmatch(seq, start, end):
+        return True
     mismatches = 0
     for pos, base in fixed_bases:
         if seq[start + pos] != base:
@@ -421,6 +384,17 @@ def matches_template(seq, start, end, fixed_bases, template_len, max_mismatch):
             if mismatches > max_mismatch:
                 return False
     return True
+
+
+def template_regex(template):
+    """
+    Compiled bytes regex that fully matches sequences with every fixed base of the template.
+    Parameters:
+            -- template: str: template of A/C/G/T/N
+    Returns:
+            -- re.Pattern: N -> any byte, A/C/G/T -> itself
+    """
+    return re.compile(template.replace("N", ".").encode(), re.DOTALL)
 
 
 # ---- per-read extraction ---------------------------------------------------
@@ -453,6 +427,7 @@ class SequenceExtractor:
         self.allowed_lens = spec.allowed_lens
         self.template_len = len(spec.template)
         self.fixed_bases = tuple((i, ord(b)) for i, b in enumerate(spec.template) if b != "N")
+        self.template_exact = template_regex(spec.template) if spec.template else None
         prefix = spec.role + "_"
         self.r_up = prefix + "upstream_not_found"
         self.r_down = prefix + "downstream_not_found"
@@ -500,8 +475,7 @@ class SequenceExtractor:
         Returns:
                 -- tuple or str: (start, end), or a reject key
         """
-        span = extract_sequence(seq, self.up, self.down, self.spec.flank_mismatch,
-                                self.spec.flank_distance)
+        span = extract_sequence(seq, self.up, self.down, self.spec.flank_mismatch)
         return self.flank_rejects[span] if span.__class__ is str else span
 
     def span(self, seq):
@@ -535,9 +509,29 @@ class SequenceExtractor:
             return self.r_length
         if self.template_len and not matches_template(
                 seq, start, end, self.fixed_bases, self.template_len,
-                self.spec.template_mismatch):
+                self.spec.template_mismatch, self.template_exact):
             return self.r_template
         return None
+
+    def fix(self, sequence):
+        """
+        Correct the fixed (non-N) template bases of a sequence that passed check: a mismatching
+        fixed base becomes the template base, e.g. template NNNNATNNNNATNNNNATNN,
+        barcode CCCCCTGGGGATCCCCATGG -> CCCCATGGGGATCCCCATGG.  Most sequences match the
+        template exactly and are returned unchanged after one regex match (C speed); only the
+        others are rebuilt, by writing the fixed bases (a loop over the fixed positions only).
+        Without a template the sequence is returned unchanged.
+        Parameters:
+                -- sequence: bytes: extracted sequence (seq[start:end] after check passed)
+        Returns:
+                -- bytes: corrected sequence
+        """
+        if self.template_exact is None or self.template_exact.fullmatch(sequence):
+            return sequence
+        fixed = bytearray(sequence)
+        for pos, base in self.fixed_bases:
+            fixed[pos] = base
+        return bytes(fixed)
 
     def locate(self, seq):
         """

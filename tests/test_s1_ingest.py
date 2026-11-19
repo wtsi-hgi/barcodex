@@ -89,6 +89,19 @@ class TestIngestChunk(unittest.TestCase):
         self.assertEqual(rejects, {"barcode_upstream_not_found": 1, "target_below_min_len": 1,
                                    "barcode_template_mismatch": 1})
 
+    def test_template_bases_corrected(self):
+        # a barcode with one wrong fixed base is corrected and merges with the exact barcode;
+        # the non-ACGT mask bit of a corrected 'N' is cleared (mask built from the fixed barcode)
+        barcode = ExtractSpec("barcode", template="NNATNN", template_mismatch=1)
+        n, agg, rejects = parse([("CCATGG", None), ("CCCTGG", None), ("CCNTGG", None)],
+                                [("ACGT", None)] * 3, barcode, ExtractSpec("target"),
+                                use_qual=True)
+        self.assertEqual(rejects, {})
+        value = agg[b"CCATGG\tACGT"]
+        self.assertEqual(list(agg), [b"CCATGG\tACGT"])
+        self.assertEqual(value & 0xFFFFFFFF, 3)
+        self.assertEqual(value >> (32 + TARGET_MASK_BITS), 0)
+
     def test_low_quality_masks_are_anded(self):
         # target base 2 is low quality in both reads, base 0 only in the first one
         n, agg, _ = parse([("AC", None)] * 2, [("ACGT", "#I#I"), ("ACGT", "II#I")],

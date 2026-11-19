@@ -25,17 +25,18 @@ PAIRS = {
 }
 
 
-def write_meta(args, with_ingest_stats=True):
+def write_meta(args, with_ingest_stats=True, pairs=None):
     """Write the four S5 input files for PAIRS (40 extracted reads, 3 dropped in S2)."""
+    pairs = PAIRS if pairs is None else pairs
     os.makedirs(meta_path(args))
     with open(meta_path(args, "target_pairs.tsv"), "w") as fo:
         fo.write(PAIR_HEADER)
-        for barcode, (barcode_reads, targets) in PAIRS.items():
+        for barcode, (barcode_reads, targets) in pairs.items():
             for rank, (target, reads) in enumerate(targets, 1):
                 fo.write("%s\t%d\t%d\t%d\t1\t%s\t%d\t0\n"
                          % (barcode, barcode_reads, rank, reads, target, reads))
     con = duckdb.connect()
-    values = ", ".join("('%s', %d, 1, %d, 0)" % (b, r, r) for b, (r, _) in PAIRS.items())
+    values = ", ".join("('%s', %d, 1, %d, 0)" % (b, r, r) for b, (r, _) in pairs.items())
     con.execute("COPY (SELECT * FROM (VALUES %s) v(barcode, count, n_cluster, first_cov, "
                 "second_cov)) TO '%s' (FORMAT PARQUET)"
                 % (values, meta_path(args, "barcode_clusters.parquet")))
@@ -166,40 +167,44 @@ class TestResolve(TempDirTestCase):
         self.assertEqual((number(None), number(3.0), number(2.345)), ("0", "3", "2.35"))
 
 
-class TestResolveMerge(TempDirTestCase):
+class TestMinPurityReads(TempDirTestCase):
 
-    def test_merge_targets_across_barcodes(self):
-        """--merge_dist 1: the 1-mismatch variant ACGTACGTAA joins the more abundant ACGTACGTAC."""
-        args = make_args(os.path.join(self.tmp, "out"), merge_dist=1, merge_ratio=1.0)
-        os.makedirs(meta_path(args))
-        # barcode, barcode_reads, rank, target_reads, target_unique, target, first_cov, second_cov
-        rows = [("BC_1", 13, 1, 10, 1, "ACGTACGTAC", 10, 0),
-                ("BC_1", 13, 2, 3, 2, "ACGTACGTAA", 2, 1),
-                ("BC_2", 4, 1, 4, 1, "ACGTACGTAA", 4, 0)]
-        with open(meta_path(args, "target_pairs.tsv"), "w") as fo:
-            fo.write(PAIR_HEADER)
-            for r in rows:
-                fo.write("%s\t%d\t%d\t%d\t%d\t%s\t%d\t%d\n" % r)
-        con = duckdb.connect()
-        con.execute("COPY (SELECT * FROM (VALUES ('BC_1', 13, 1, 13, 0), ('BC_2', 4, 1, 4, 0)) "
-                    "v(barcode, count, n_cluster, first_cov, second_cov)) TO '%s' (FORMAT PARQUET)"
-                    % meta_path(args, "barcode_clusters.parquet"))
-        con.close()
-        with open(meta_path(args, "raw_stats.json"), "w") as fo:
-            json.dump({"raw_barcodes": 2, "raw_targets": 2, "reads_in": 17, "reads_clustered": 17}, fo)
+    PAIRS = {
+        # 8 / 12 = 0.67 with all reads; without the four 1-read targets 8 / 8 = 1.0
+        "BC_NOISY": (12, [("TGT_A", 8), ("TGT_B", 1), ("TGT_C", 1), ("TGT_D", 1),
+                          ("TGT_E", 1)]),
+        # 8 / 12 = 0.67; without the 1-read targets 8 / 10 = 0.8; without < 3 reads 8 / 8
+        "BC_TWO":   (12, [("TGT_A", 8), ("TGT_B", 2), ("TGT_C", 1), ("TGT_D", 1)]),
+        # 2 / 3 with all reads; 2 / 2 with 2; with 3 the top target (2 reads, below 3) still
+        # counts, so 2 / 2 and not 2 / 0
+        "BC_TOP2":  (3, [("TGT_A", 2), ("TGT_B", 1)]),
+    }
+
+    def final(self, min_purity_reads):
+        """Final barcodes for one --min_purity_reads (--min_purity 0.8, --min_pair_reads 2)."""
+        args = make_args(os.path.join(self.tmp, "mpr%d" % min_purity_reads, "out"),
+                         min_purity_reads=min_purity_reads)
+        os.makedirs(os.path.dirname(args.out))
+        write_meta(args, pairs=self.PAIRS)
         resolve_pairs(args, 1)
-        targets = {r["barcode"]: r for r in read_tsv(args.out + ".barcode_target.details.tsv")}
-        self.assertEqual(sorted(targets), ["BC_1", "BC_2"])
-        # BC_1: both clusters merged -> 13 reads, 3 variants, top two coverages 10 and 2
-        self.assertEqual({k: targets["BC_1"][k] for k in ("target", "target_reads", "n_diff_targets",
-                                                          "first_target_cov", "first_target_ratio",
-                                                          "second_target_cov", "second_target_ratio")},
-                         {"target": "ACGTACGTAC", "target_reads": "13", "n_diff_targets": "3",
-                          "first_target_cov": "10", "first_target_ratio": "0.7692",
-                          "second_target_cov": "2", "second_target_ratio": "0.1538"})
-        # BC_2 only saw the variant: it is reported as the root sequence
-        self.assertEqual((targets["BC_2"]["target"], targets["BC_2"]["target_reads"]),
-                         ("ACGTACGTAC", "4"))
+        rows = read_tsv(args.out + ".barcode_target.details.tsv")
+        stats = {r["stat"]: r for r in read_tsv(args.out + ".stats.tsv")}
+        return sorted(r["barcode"] for r in rows), stats
+
+    def test_default_uses_all_reads(self):
+        barcodes, stats = self.final(1)
+        self.assertEqual(barcodes, [])
+        self.assertEqual(stats["num_barcodes_ambiguous"]["count"], "3")
+        self.assertNotIn("--min_purity_reads", stats["num_barcodes_ambiguous"]["description"])
+
+    def test_ignore_one_read_targets(self):
+        barcodes, stats = self.final(2)
+        self.assertEqual(barcodes, ["BC_NOISY", "BC_TOP2", "BC_TWO"])
+        self.assertIn("--min_purity_reads", stats["num_barcodes_resolved"]["description"])
+
+    def test_top_target_always_counts(self):
+        barcodes, _ = self.final(3)
+        self.assertEqual(barcodes, ["BC_NOISY", "BC_TOP2", "BC_TWO"])
 
 
 if __name__ == "__main__":

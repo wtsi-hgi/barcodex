@@ -14,8 +14,7 @@ Python >= 3.11 (tested with 3.11.2; DuckDB 2 needs 3.11), and these packages:
 | package | version (tested) | used for |
 |---------|------------------|----------|
 | `duckdb` | >= 2.0 (2.0.0) | all out-of-core work: compaction (S1), barcode clustering (S2), sharding (S3), reading the shards (S4), target assignment and the output files (S5) |
-| `numpy`  | >= 1.20 (2.3.5) | flank method, `--flank_distance hamming`: compares the flank with every window of a read at once |
-| `edlib`  | >= 1.3 (1.3.9.post1) | flank method, `--flank_distance levenshtein`: edit distance (substitutions and indels) between the flank and a window |
+| `edlib`  | >= 1.3 (1.3.9.post1) | flank method: flanks that are not an exact match are found by an infix alignment (substitutions and indels) |
 | `pytest` | optional | the tests use only `unittest`; pytest can run them too |
 
 Everything else is the Python standard library (argparse, multiprocessing, gzip, json, ...).
@@ -58,31 +57,43 @@ target between flanks, and `--method flank none` uses the whole target read.
 |---------|-----------------|---------------------------------------|
 | `none`  | the whole read | none |
 | `pos`   | a fixed window | `--*_start` (0-based), `--*_len` (0 = to the end of the read) |
-| `flank` | between two flanking sequences | `--*_up`, `--*_down`, and `--flank_mismatch` (default 2) and `--flank_distance` (`hamming` or `levenshtein`, default `hamming`), both shared by barcode and target |
+| `flank` | between two flanking sequences | `--*_up`, `--*_down`, and `--flank_mismatch` (default 2, shared by barcode and target) |
 
 * **pos**: a barcode read that is too short is rejected (`barcode_too_short`). A short target is
   kept as it is.
-* **flank**: the flanks are found with the functions of `nf_starr_seq/scripts/sequence_utils.py`
-  (`extract_sequence`, `match_approximate`, `match_hamming_numpy`, `match_levenshtein`), ported
-  to barcodex with the same logic. They use the sequence only, without base qualities. The
-  upstream flank is searched first. The barcode / target starts `len(--*_up)` bases after the start
-  of the upstream match and ends where the downstream match starts (searched after the upstream
-  flank). `--flank_distance` (shared by barcode and target) chooses how a flank is matched:
-  * `hamming` (default, `match_hamming_numpy`): the first window, of the flank length, with at
-    most `--flank_mismatch` substitutions. numpy compares all windows at once. This gave the same
-    barcode / target / reject reason for every read as the reference scripts: 100,000 reads
-    against `associate_sequences.py` and 200,000 reads against `associate_variant_barcode.py`.
-  * `levenshtein` (`match_levenshtein`): the first window, of the flank length, whose edit distance
-    to the flank (substitutions and indels, edlib) is at most `--flank_mismatch`.
-  * Both give the same window as the `sequence_utils.py` functions; this was checked on 50,000
-    (Hamming) and 5,000 (Levenshtein) combi_6 reads and on random reads in the unit tests.
-    barcodex only makes them faster without changing the result: Hamming compares only the
-    windows up to an exact match, and Levenshtein skips ranges of windows that an edlib infix
-    search shows cannot match (40-65 µs per read instead of 800).
-  * Because the window has the flank length, Levenshtein results can differ from what you might
-    expect. A 1-base deletion in a flank costs 2 edits: the deletion, plus one more base pulled
-    into the window. Also, with `--flank_mismatch 2` the window one base before an exact flank
-    already matches (one deletion and one insertion), so the match starts one base early.
+* **flank**: the flanks are found on the sequence only, without base qualities. The upstream
+  flank is searched first. The barcode / target starts where the upstream flank match ends and
+  ends where the downstream flank match starts (searched after the upstream flank). Each flank
+  is found in two steps (`find_flank`):
+  1. an exact match (`bytes.find`, C speed; most reads);
+  2. otherwise the best edlib infix alignment with at most `--flank_mismatch` edits
+     (substitutions and indels, `match_edlib`). The match boundaries are the alignment
+     boundaries, so an indel inside a flank does not shift the barcode / target. When several
+     alignments have the same number of edits, one of the flank length (substitutions) is
+     preferred, then the leftmost.
+
+  This replaced the Hamming window search (`match_hamming_numpy`) and the fixed-length
+  Levenshtein window search (`match_levenshtein`) of `nf_starr_seq/scripts/sequence_utils.py`,
+  and the option `--flank_distance` that chose between them. An indel near the inner end of a
+  flank (next to the barcode / target) shifts only the last flank bases, so the Hamming window is
+  accepted with 1-2 mismatches and the sequence comes out shifted by one base; the old Levenshtein
+  window search shifted the sequence even for exact flanks (with `--flank_mismatch 2` the window
+  one base before an exact flank already matches). Simulated reads with the hek16 barcode flanks
+  (21 / 20 bp, 38 bp barcode, `--flank_mismatch 2`), 5,000 reads per row, % correct / wrong
+  barcode / lost:
+
+  | upstream flank | old Hamming | barcodex |
+  |---|---|---|
+  | exact | 100 / 0 / 0 | 100 / 0 / 0 |
+  | 1 substitution | 100 / 0 / 0 | 100 / 0 / 0 |
+  | 2 substitutions | 100 / 0 / 0 | 99.9 / 0.1 / 0 |
+  | 1 indel | 14.4 / 6.4 / 79.2 | 98.1 / 1.9 / 0 |
+  | 1 indel 2-3 bases from the barcode | 0 / 62.8 / 37.2 | 80.8 / 19.2 / 0 |
+
+  The remaining "wrong" cases are ties: another explanation with the same number of edits
+  (e.g. an insertion next to the barcode = a substitution + a 1-base shift); no method can tell
+  them apart. Speed (95% exact, 4% 1 substitution, 1% 1 indel): 1.5 µs per read, the Hamming
+  window search 83 µs.
 * An option of another method is an error, for example `--method none none --barcode_len 16`.
 
 Filters, for any method:
@@ -91,7 +102,12 @@ Filters, for any method:
 * `--*_allowed_lens 19,20,21` (or `19-21`) keeps only these lengths.
 * `--barcode_temp NNNNATNN...` applies to barcodes only. The barcode must have the template length,
   and its fixed (non-N) bases may differ in at most `--barcode_temp_mismatch` positions
-  (default 1). This is the same rule as `check_barcode` in the splicing pipeline.
+  (default 1). This is the same rule as `check_barcode` in the splicing pipeline. A barcode that
+  passes with mismatching fixed bases is then corrected: those bases are set to the template base
+  (template `NNNNATNNNNATNNNNATNN`, barcode `CCCCCTGGGGATCCCCATGG` -> `CCCCATGGGGATCCCCATGG`), so
+  it is counted with the error-free barcode already in S1. Most barcodes match the template
+  exactly and are passed through after one regex match; only the others are rebuilt (0.4 µs per
+  barcode, 7x faster than a per-base loop over the whole barcode, same result).
 * Targets longer than 255 bp are rejected (`target_too_long`). This is the width of the target
   quality mask.
 
@@ -225,10 +241,14 @@ All rows:
 
 * `percent` is filled for `reads_*` rows (`count / reads_raw_input x 100`) and is `NA` otherwise.
 * Barcode status in `5_target_assignment`:
-  * resolved: multi-target barcode whose top target has >= `--min_pair_reads` reads and >=
-    `--min_purity` of the barcode's reads; kept with that target.
-  * ambiguous: multi-target barcode whose top target has enough reads but < `--min_purity` of
-    the barcode's reads (no dominant target); dropped.
+  * resolved: multi-target barcode whose top target has >= `--min_pair_reads` reads and a
+    purity >= `--min_purity`; kept with that target.
+  * ambiguous: multi-target barcode whose top target has enough reads but a purity <
+    `--min_purity` (no dominant target); dropped.
+  * purity = top target reads / purity reads. Purity reads = the barcode's reads minus the reads
+    of its other targets with < `--min_purity_reads` reads (after target clustering; the top
+    target always counts). `--min_purity_reads 1` (default): all of the barcode's reads.
+    `--min_purity_reads 2`: 1-read targets, mostly noise, do not lower the purity.
   * low coverage: any barcode (single- or multi-target) whose top target has <
     `--min_pair_reads` reads; dropped.
   * `num_final_barcodes` = single-target barcodes that pass `--min_pair_reads` + resolved barcodes.
@@ -261,12 +281,12 @@ Also in the output directory:
 
 | test file | what it covers |
 |-----------|----------------|
-| `test_extract.py` | none / pos / flank extraction (Hamming and Levenshtein flanks), length and template filters |
+| `test_extract.py` | none / pos / flank extraction (Hamming, edlib and exact-then-edlib flanks), length and template filters, template correction |
 | `test_cli.py` | options, `--method`, validation, `cmd.log`, `--version` |
 | `test_s1_ingest.py` | FASTQ reader, read parsing and reject order, part files, compaction, step S1 |
 | `test_s2_s3_barcodes_shards.py` | barcode clustering (S2) and sharding (S3) |
 | `test_s4_targets.py` | edit distance, target clustering within a barcode, step S4 |
-| `test_s5_resolve.py` | one target per barcode, output columns, stats file by step, `--merge_dist` |
+| `test_s5_resolve.py` | one target per barcode, output columns, stats file by step, `--min_purity_reads` |
 | `test_all_steps.py` | all steps on synthetic data (`pos none` and `flank pos` scenarios) |
 
 ## Code conventions

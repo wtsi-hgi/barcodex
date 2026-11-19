@@ -71,7 +71,8 @@ def ingest_chunk(barcode_chunk, target_chunk, cfg, agg, tables, extractors, reje
     """
     Parse one pair of FASTQ chunks into the aggregation dict.
     The barcode and the target are cut out of their reads by the extractors (whole read, fixed
-    position or flanking sequences) and filtered (length, template).  A read
+    position or flanking sequences) and filtered (length, template); with --barcode_temp the
+    mismatching fixed bases of a passing barcode are corrected to the template.  A read
     pair is rejected when a check fails; only the first reason is counted in `rejects`, in the
     order target extraction, barcode extraction, target filters, barcode filters.
     Duplicate (barcode, target) pairs merge with count += 1 and mask &= new_mask, so a base stays
@@ -94,6 +95,7 @@ def ingest_chunk(barcode_chunk, target_chunk, cfg, agg, tables, extractors, reje
     use_mask = use_target_qual or use_barcode_qual
     to_acgt, nonacgt, target_lowq, barcode_lowq = tables
     span_barcode, check_barcode = extractors[0].span, extractors[0].check
+    fix_barcode = extractors[0].fix if extractors[0].template_exact is not None else None
     span_target, check_target = extractors[1].span, extractors[1].check
 
     # step2 : split both chunks into lines and pick the (upper-case) sequence / quality lines
@@ -127,6 +129,8 @@ def ingest_chunk(barcode_chunk, target_chunk, cfg, agg, tables, extractors, reje
             rejects[reason] = rejects.get(reason, 0) + 1
             continue
         barcode = barcode_full[bc_start:bc_end]
+        if fix_barcode is not None:                 # --barcode_temp: fixed bases -> template
+            barcode = fix_barcode(barcode)
         target = target_full[tg_start:tg_end]
         #      |----   substep quality-aware barcodes > 32 bp do not fit the mask (targets > 255 bp: see check)
         if use_barcode_qual and bc_end - bc_start > MAX_QUAL_BARCODE_LEN:
@@ -316,9 +320,7 @@ def describe_spec(spec):
     if spec.method == "pos":
         text = "pos: start %d, length %s" % (spec.start, spec.length or "to read end")
     elif spec.method == "flank":
-        text = "flank: %s / %s (<= %d mismatches, %s)" % (spec.up, spec.down,
-                                                           spec.flank_mismatch,
-                                                           spec.flank_distance)
+        text = "flank: %s / %s (<= %d edits)" % (spec.up, spec.down, spec.flank_mismatch)
     else:
         text = "none: whole read"
     if spec.min_len:
@@ -357,7 +359,7 @@ def stage_ingest(args, work, threads, mem_gb):
     S1: FASTQ -> compacted Parquet tuple store  <work>/tuples/t*.parquet.
     Starts one reader process per FASTQ role and the parse workers, supervises them, drives the
     background compaction and writes <out>.meta/ingest_stats.json and <work>/ingest.done.
-    Uses args: barcode_read, target_read, method, flank_mismatch, flank_distance,
+    Uses args: barcode_read, target_read, method, flank_mismatch,
     barcode_* / target_* options, phred_offset, chunk, agg_entries, compact_parts, merge_files,
     max_reads, no_pigz.
     Parameters:
